@@ -1,0 +1,6 @@
+pydantic[dotenv]
+asyncpg
+buildpg
+pyarrow
+pandas
+orjson
