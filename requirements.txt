@@ -4,3 +4,4 @@ buildpg
 pyarrow
 pandas
 orjson
+boto3

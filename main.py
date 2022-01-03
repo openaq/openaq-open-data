@@ -8,20 +8,22 @@ from pyarrow import csv
 import pyarrow.parquet as pq
 from pandas import DataFrame
 from datetime import datetime
-
-LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
-WRITE_FILE_FORMAT = os.environ.get('WRITE_FILE_FORMAT', 'csv')
+from config import settings
+from io import StringIO, BytesIO
+import boto3
 
 logging.basicConfig(
     format = '[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s',
-    level = LOG_LEVEL,
+    level = settings.LOG_LEVEL,
 )
 
 logger = logging.getLogger(__name__)
+s3 = boto3.client("s3")
 
 
 def get_station_days():
-    """get the entire set of station/days"""
+    """get the entire set of station/days."""
+
     sql = """
     SELECT sn.sensor_nodes_id
     , (m.datetime-'1sec'::interval)::date::text as day
@@ -43,6 +45,10 @@ def get_modified_station_days():
     """get the set of station/days that need to be updated."""
     sql = """
     -- Query needed
+    -- UPDATE open_data_audit_log
+    -- SET queued_on = now()
+    -- WHERE modified_on > exported_on
+    -- RETURNING sensor_nodes_id, date, modified_on
     """
     db = DB()
     return db.rows(sql, {});
@@ -143,20 +149,23 @@ def pivot(obj: dict):
         data = {}
         measurands = []
         for row in obj:
+            #print(row)
+            station = row['site_name']
             datetime = row['datetime']
             measurand = row['measurand']
             value = row['value']
             if datetime not in data.keys():
-                data[datetime] = {}
+                data[datetime] = { 'station': station }
             if measurand not in data[datetime].keys():
                 data[datetime][measurand] = value
             if measurand not in measurands:
                 measurands.append(measurand)
     # Now loop through the dates and the measurands to build the dataframe
-    df = { 'datetime': [] };
+    df = { 'datetime': [], 'station': [] };
     for datetime in data.keys():
         row = data[datetime]
         df['datetime'].append(datetime)
+        df['station'].append(row['station'])
         for measurand in measurands:
             if measurand not in df.keys():
                 df[measurand] = []
@@ -178,16 +187,34 @@ def convert(df):
 
 def write_file(tbl, filepath: str = 'example'):
     """write the results in the given format"""
-    if not isinstance(tbl, pyarrow.lib.Table):
-        tbl = convert(tbl)
-    if WRITE_FILE_FORMAT == 'csv':
+    #if not isinstance(tbl, pyarrow.lib.Table):
+    #    tbl = convert(tbl)
+    if settings.WRITE_FILE_FORMAT == 'csv':
         logger.debug('writing file to csv format')
-        csv.write_csv(tbl, f"{filepath}.csv")
+        out = StringIO()
+        ext = 'csv'
+        mode = 'w'
+        tbl.to_csv(out)
     else:
         logger.debug('writing file to parquet format')
-        pq.write_table(tbl, f"{filepath}.parquet")
+        out = BytesIO()
+        ext = 'parquet'
+        mode = 'wb'
+        tbl.to_parquet(out, index=False)
+        #pq.write_table(tbl, )
 
-
+    if settings.OPEN_DATA_BUCKET is not None and settings.OPEN_DATA_BUCKET != '':
+        logger.debug(f"writing file to bucket: {settings.OPEN_DATA_BUCKET}")
+        s3.put_object(
+            Bucket=settings.OPEN_DATA_BUCKET,
+            Key=f"{filepath}.{ext}",
+            Body=out.getvalue()
+        )
+    else:
+        logger.debug(f"writing file to local file")
+        txt = open(f"{filepath}.{ext}", mode)
+        txt.write(out.getvalue())
+        txt.close()
 
 
 start = time.time()
@@ -204,11 +231,10 @@ for d in days:
         ))
         # transform the data
         df = pivot(rows)
-        tbl = convert(df)
+        ## tbl = convert(df)
         # write the data
-        write_file(tbl, f"data/sn-{node}-{day}")
+        write_file(df, f"data/sn-{node}-{day}")
     except Exception as e:
-        print(rows)
         logger.warning(f"Error processing {node}-{day}: {e}");
 
 

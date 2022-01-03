@@ -12,6 +12,9 @@ env_file = Path.joinpath(env_path, ".env")
 
 
 class Settings(BaseSettings):
+    LOG_LEVEL: str = 'DEBUG'
+    WRITE_FILE_FORMAT: str = 'csv'
+    OPEN_DATA_BUCKET: str = ''
     DATABASE_READ_USER: str# = 'apiuser'
     DATABASE_READ_PASSWORD: str# = 'apiuserpw'
     DATABASE_WRITE_USER: str# = 'postgres'
@@ -29,7 +32,6 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = env_file
-
 
 
 settings = Settings()
