@@ -13,7 +13,10 @@ env_file = Path.joinpath(env_path, ".env")
 
 class Settings(BaseSettings):
     LOG_LEVEL: str = 'DEBUG'
-    WRITE_FILE_FORMAT: str = 'csv'
+    LIMIT: int = 500
+    LOCAL_SAVE_DIRECTORY: str
+    WRITE_FILE_LOCATION: str = 's3' # local
+    WRITE_FILE_FORMAT: str = 'csv' # parquet, json
     OPEN_DATA_BUCKET: str = ''
     DATABASE_READ_USER: str# = 'apiuser'
     DATABASE_READ_PASSWORD: str# = 'apiuserpw'

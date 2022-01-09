@@ -1,2 +1,6 @@
 __pycache__/*
 cdk/.venv
+data/*
+/testing/testfile*
+/.env
+/.notes

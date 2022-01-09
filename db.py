@@ -21,7 +21,7 @@ class DB:
         if self.pg_pool is None:
             self.pg_pool = await asyncpg.create_pool(
                 settings.DATABASE_READ_URL,
-                command_timeout=14,
+                command_timeout=200,
                 max_inactive_connection_lifetime=15,
                 min_size=1,
                 max_size=10,
@@ -29,80 +29,65 @@ class DB:
         return self.pg_pool
 
 
-    async def rows(self, query, kwargs):
+    async def __query(
+            self,
+            query: str,
+            params: dict,
+            method: str = 'rows',
+    ):
         start = time.time()
         pool = await self.pool()
-        rquery, args = render(query, **kwargs)
+        rquery, args = render(query, **params)
         logger.debug(f"Running query: {rquery}, {args}")
         async with pool.acquire() as con:
             try:
                 stm = await con.prepare(rquery)
                 fields = [a.name for a in stm.get_attributes()]
-                data = await stm.fetch(*args)
+                if method == 'row':
+                    data = await stm.fetchrow(*args)
+                elif method == 'value':
+                    data = await stm.fetchval(*args)
+                else:
+                    data = await stm.fetch(*args)
+                n = len(data)
             except Exception as e:
                 logger.warning(f"{e}");
                 raise ValueError(f"{e}")
-
-        if self.response_format == 'dataframe':
-            data = DataFrame(data, columns=fields)
-
         dur = time.time() - start
         self.query_time += dur
-        logger.info(
-            "seconds: %0.4f, results: %s",
-            dur,
-            len(data),
-        )
-        return data
+        logger.info("query rows: seconds: %0.4f, results: %s", dur, n)
+        return data, fields, n
 
-    async def row(self, query, kwargs):
-        start = time.time()
-        pool = await self.pool()
-        rquery, args = render(query, **kwargs)
-        logger.debug(f"Running query: {rquery}, {args}")
-        async with pool.acquire() as con:
-            try:
-                stm = await con.prepare(rquery)
-                fields = [a.name for a in stm.get_attributes()]
-                data = await stm.fetchrow(*args)
-            except Exception as e:
-                logger.warning(f"{e}");
-                raise ValueError(f"{e}")
-
-        if self.response_format == 'dataframe':
+    async def rows(
+            self,
+            query: str,
+            response_format: str = 'default',
+            **kwargs
+    ):
+        data, fields, n = await self.__query(query, params = kwargs, method='rows')
+        if response_format == 'DataFrame' or self.response_format == 'DataFrame':
             data = DataFrame(data, columns=fields)
-
-        dur = time.time() - start
-        self.query_time += dur
-        logger.info(
-            "seconds: %0.4f, results: %s",
-            dur,
-            len(data),
-        )
         return data
 
+    async def row(
+            self,
+            query: str,
+            response_format: str = 'default',
+            **kwargs
+    ):
+        data, fields, n = await self.__query(query, params = kwargs, method='row')
+        if response_format == 'DataFrame' or self.response_format == 'DataFrame':
+            print(fields)
+            data = DataFrame([data], columns=fields)
+        return data
 
-    async def value(self, query, kwargs):
-        start = time.time()
-        pool = await self.pool()
-        rquery, args = render(query, **kwargs)
-        logger.debug(f"Running query: {rquery}, {args}")
-        async with pool.acquire() as con:
-            try:
-                stm = await con.prepare(rquery)
-                data = await stm.fetchval(*args)
-            except Exception as e:
-                logger.warning(f"{e}");
-                raise ValueError(f"{e}")
-
-        if self.response_format == 'json':
+    async def value(
+            self,
+            query: str,
+            response_format: str = 'default',
+            **kwargs
+    ):
+        data, fields, n = await self.__query(query, params = kwargs, method='value')
+        if response_format == 'json' or self.response_format == 'json':
             data = orjson.loads(data)
-
-        dur = time.time() - start
-        self.query_time += dur
-        logger.info(
-            "seconds: %0.4f, results: %s",
-            dur,
-            len(data),
-        )
         return data
