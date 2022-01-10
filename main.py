@@ -97,7 +97,19 @@ def get_measurement_data(
     #AND (m.datetime - '1sec'::interval)::date = :day
     #, p.measurand||'-'||ss.sensor_systems_id||'-'||p.units as measurand
     sql = """
-    SELECT *
+    SELECT sensor_nodes_id as location_id
+    , sensors_id
+    , measurands_id
+    , location
+    , country
+    , ismobile
+    , sensor
+    , datetime
+    , measurand
+    , units
+    , value
+    , lon
+    , lat
     FROM measurement_data_export
     WHERE sensor_nodes_id = :sensor_nodes_id
     AND (datetime - '1sec'::interval)::date = :day
@@ -169,8 +181,11 @@ async def export_data(day, node, range = 'day'):
             day = day,
         )
         country = rows['country'][0]
-        df = reshape(rows, fields = ["location","datetime","lat", "lon", "measurand", "value"])
-        filepath = f"records/{settings.WRITE_FILE_FORMAT}/country={country}/locationid={node}/year={day.year}/month={day.month}/loc-{node}-{day.year}{day.month}{day.day}"
+        df = reshape(rows, fields = ["location_id","sensor_id","location","datetime","lat", "lon", "measurand", "value"])
+        yr = day.strftime('%Y')
+        mn = day.strftime('%m')
+        dy = day.strftime('%d')
+        filepath = f"records/{settings.WRITE_FILE_FORMAT}/country={country}/locationid={node}/year={yr}/month={mn}/loc-{node}-{yr}{mn}{dy}"
         write_file(df, filepath)
         await update_export_log(day, node)
     except Exception as e:

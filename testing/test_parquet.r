@@ -8,7 +8,7 @@
 ## Version:
 ## Last-Updated:
 ##           By:
-##     Update #: 28
+##     Update #: 29
 ## URL:
 ## Keywords:
 ## Compatibility:
@@ -113,7 +113,7 @@ legend("bottomright", legend=c("csv","csv.gz","parquet"), pch=15, cex=1.5, pt.ce
 dev.off()
 
 ## models
-lm(csv~n, results)
+lm(csv.gz~n, results)
 
 
 ######################################################################
