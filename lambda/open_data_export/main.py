@@ -1,32 +1,57 @@
 import logging
 import os
-from db import DB
-import asyncio
+
+from open_data_export.pgdb import DB
+from open_data_export.config import settings
+
+#import asyncio
 import time
 import pyarrow
 from pyarrow import csv
 import pyarrow.parquet as pq
 from pandas import DataFrame
 from datetime import datetime
-from config import settings
 from io import StringIO, BytesIO
 from typing import Union
 import boto3
 
+logger = logging.getLogger(__name__)
+
 logging.basicConfig(
     format = '[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s',
     level = settings.LOG_LEVEL,
+    force = True,
 )
 
-logger = logging.getLogger(__name__)
+
 s3 = boto3.client("s3")
 db = None
+#settings = Settings()
 
 def get_database():
     global db
     if db is None:
         db = DB()
     return db
+
+def ping(event, context):
+    """
+    Test environmental variables and database connection
+    """
+    ctime = "failed"
+    total = "failed"
+    exported = "failed"
+    db = get_database()
+    try:
+        print('starting #1')
+        ctime = db.value('SELECT now()::text as now')
+        total, exported = db.row('SELECT COUNT(1) as total, SUM((exported_on IS NOT NULL)::int) as exported FROM open_data_export_logs')
+        return f"{exported} of {total} rows as of {ctime}"
+    except Exception as e:
+        logger.warning(f"something failed. {e}")
+    finally:
+        logger.info(f"HOST: {settings.DATABASE_HOST}, EVENT: {event}, LOCATION: {settings.WRITE_FILE_LOCATION} TIME: {ctime} TOTAL: {total}, EXPORTED: {exported}")
+
 
 def reset_queue():
     """
@@ -38,15 +63,15 @@ def reset_queue():
     db = get_database()
     return db.rows(sql, response_format='DataFrame')
 
-def update_export_log(day: str, node: int):
+def update_export_log(day: str, node: int, n: int):
     """Mark the location/day as exported"""
     if isinstance(day, str):
         day = datetime.fromisoformat(day).date()
     sql = """
-    SELECT update_export_log_exported(:day, :node)
+    SELECT update_export_log_exported(:day, :node, :n)
     """
     db = get_database()
-    return db.rows(sql, day = day, node = node)
+    return db.rows(sql, day = day, node = node, n = n)
 
 def get_all_location_days():
     """get the entire set of location/days."""
@@ -74,7 +99,7 @@ def get_pending_location_days():
     SELECT * FROM get_pending({settings.LIMIT})
     """
     db = get_database()
-    return db.rows(sql, {});
+    return db.rows(sql)#, response_format='DataFrame');
 
 
 def get_measurement_data(
@@ -90,8 +115,8 @@ def get_measurement_data(
         day = datetime.fromisoformat(day).date()
 
     where = {
-        'sensor_nodes_id': sensor_nodes_id,
         'day': day,
+        'sensor_nodes_id': f"{sensor_nodes_id}",
     }
 
     #AND (m.datetime - '1sec'::interval)::date = :day
@@ -104,7 +129,7 @@ def get_measurement_data(
     , country
     , ismobile
     , sensor
-    , datetime
+    , datetime_str as datetime
     , measurand
     , units
     , value
@@ -163,9 +188,9 @@ def write_file(tbl, filepath: str = 'example'):
              Body=out.getvalue()
          )
     elif settings.WRITE_FILE_LOCATION == 'local':
-        logger.debug(f"writing file to local file in {settings.LOCAL_SAVE_DIRECTORY}")
         filepath = os.path.join(settings.LOCAL_SAVE_DIRECTORY, filepath)
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        logger.debug(f"writing file to local file in {filepath}")
         txt = open(f"{filepath}.{ext}", mode)
         txt.write(out.getvalue())
         txt.close()
@@ -173,49 +198,52 @@ def write_file(tbl, filepath: str = 'example'):
         raise Exception(f"{settings.WRITE_FILE_LOCATION} is not a valid location")
 
 
-async def export_data(day, node, range = 'day'):
+def export_data(day, node, range = 'day'):
     try:
         start = time.time()
-        rows=await get_measurement_data(
+        rows = get_measurement_data(
             sensor_nodes_id = node,
             day = day,
         )
         country = rows['country'][0]
-        df = reshape(rows, fields = ["location_id","sensor_id","location","datetime","lat", "lon", "measurand", "value"])
+        df = reshape(rows, fields = ["location_id","sensors_id","location","datetime","lat", "lon", "measurand", "value"])
         yr = day.strftime('%Y')
         mn = day.strftime('%m')
         dy = day.strftime('%d')
-        filepath = f"records/{settings.WRITE_FILE_FORMAT}/country={country}/locationid={node}/year={yr}/month={mn}/loc-{node}-{yr}{mn}{dy}"
+        filepath = f"records/{settings.WRITE_FILE_FORMAT}/country={country}/locationid={node}/year={yr}/month={mn}/location-{node}-{yr}{mn}{dy}"
         write_file(df, filepath)
-        await update_export_log(day, node)
+        update_export_log(day, node, len(rows))
     except Exception as e:
-        logger.warning(f"Error processing {node}-{day}: {e}");
+        logger.warning(f"Error processing {node}-{day}-{settings.OPEN_DATA_BUCKET}: {e}");
     finally:
-        logger.info("export seconds: %0.4f", time.time() - start)
+        logger.info("export_data: %0.4f", time.time() - start)
 
-async def export_pending():
+def export_pending(event = {}, context = {}):
     """Only export the location/days that are marked for export. Location days will be limited to the value in the LIMIT environmental parameter"""
+    if 'source' not in event.keys():
+        event['source'] = 'not set'
     start = time.time()
-    days = await get_pending_location_days()
+    days = get_pending_location_days()
     for d in days:
-        await export_data(d['day'], d['sensor_nodes_id'])
+        export_data(d[1], d[0])
     logger.info(
-        "export_pending: %s; seconds: %0.4f",
+        "export_pending: %s; seconds: %0.4f; source: %s",
         len(days),
         time.time() - start,
+        event['source'],
     )
     return days
 
-async def export_all():
+def export_all():
     """Export all location/days in the database. This will reset the export log and then run the `export_pending` method."""
-    await reset_export_log()
+    reset_queue()
     return export_pending();
 
 if __name__ == '__main__':
     #rsp = asyncio.run(export_all())
     #rsp = asyncio.run(reset_queue())
     #rsp = asyncio.run(get_pending_location_days())
-    rsp = asyncio.run(export_pending())
+    #rsp = asyncio.run(export_pending())
     #rsp = asyncio.run(update_export_log('2021-08-08', 1))
     #print(rsp)
     print(f"total query time: {db.query_time}")

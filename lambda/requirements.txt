@@ -1,5 +1,6 @@
 pydantic[dotenv]
-asyncpg
+#asyncpg
+psycopg[binary]
 buildpg
 pyarrow
 pandas

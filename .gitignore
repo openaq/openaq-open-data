@@ -4,3 +4,5 @@ data/*
 /testing/testfile*
 /.env
 /.notes
+lambda/__pycache__/*
+lambda/open_data_export/__pycache__/*

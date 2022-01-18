@@ -2,7 +2,8 @@ import asyncpg
 import time
 import logging
 
-from config import settings
+#from config import settings
+from open_data_export.config import settings
 from buildpg import render
 from pandas import DataFrame
 import orjson
@@ -20,7 +21,7 @@ class DB:
     async def pool(self):
         if self.pg_pool is None:
             self.pg_pool = await asyncpg.create_pool(
-                settings.DATABASE_READ_URL,
+                settings.DATABASE_WRITE_URL,
                 command_timeout=200,
                 max_inactive_connection_lifetime=15,
                 min_size=1,
@@ -50,13 +51,16 @@ class DB:
                 else:
                     data = await stm.fetch(*args)
                 n = len(data)
+                dur = time.time() - start
+                self.query_time += dur
+                logger.info("query rows: seconds: %0.4f, results: %s", dur, n)
+                return data, fields, n
             except Exception as e:
-                logger.warning(f"{e}");
-                raise ValueError(f"{e}")
-        dur = time.time() - start
-        self.query_time += dur
-        logger.info("query rows: seconds: %0.4f, results: %s", dur, n)
-        return data, fields, n
+                logger.warning(f"Query error: {e}");
+                raise ValueError(f"{e}") from None
+            finally:
+                logger.warning("releasing connection")
+                await pool.release(con)
 
     async def rows(
             self,
