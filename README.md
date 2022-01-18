@@ -15,6 +15,30 @@ Lambda functions are not meant to run for very long and will timeout after a set
 * Schedule: Another way to increase the rate would be to schedule the function to be run more often. It will take about 20min for every 1000 stations given the 1.25 sec/location/day rate.
 * Timeout: finally you could increase the timeout as needed
 
+# Settings
+```shell
+# The log level to use, must be capitalized
+LOG_LEVEL=INFO
+# The number of location/days to pull down at once
+LIMIT=500
+# Where to export the files to, could be s3 or local
+WRITE_FILE_LOCATION=s3
+# The format to export the data as, could be csv, csv.gz or parquet
+WRITE_FILE_FORMAT=csv
+# The bucket to export to when using the s3 write method
+OPEN_DATA_BUCKET=openaq-open-data-testing
+# The directory to export to when using the local method
+LOCAL_SAVE_DIRECTORY=data
+# Database parameters
+DATABASE_READ_USER=postgres
+DATABASE_READ_PASSWORD=postgres
+DATABASE_WRITE_USER=postgres
+DATABASE_WRITE_PASSWORD=postgres
+DATABASE_HOST=172.17.0.2
+DATABASE_PORT=5432
+DATABASE_DB=postgres
+```
+
 # Installing
 You will need to install a few different parts to get this working.
 1. Update your database to include the export module (see `tables/exports.sql` and `idempotent/exports_views.sql` in the `openaq-db` repository).

@@ -1,7 +1,18 @@
 
-# Welcome to your CDK Python project!
+# Installing on AWS
 
-This is a blank project for Python development with CDK.
+The stacks provided require a `.env` file in order to be installed. An example file is provided and can be modified as needed. The process takes advantage of the DockerFile to generate a package.zip directory that is a small as possible.
+
+The easiest way to install a new stack is to:
+- Create a new `.env` file with the desired settings
+- Create a new instance of the `OpenDataStack` and include your new `.env` file.
+```shell
+cdk deploy name-of-stack
+
+```
+
+
+# Boilerplate AWS language
 
 The `cdk.json` file tells the CDK Toolkit how to execute your app.
 

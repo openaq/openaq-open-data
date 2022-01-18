@@ -10,8 +10,7 @@ if 'OPEN_DATA_DOT_ENV' not in environ:
 if 'WRITE_FILE_LOCATION' not in environ:
     environ['WRITE_FILE_LOCATION'] = 's3'
 
-from open_data_export.config import settings
-#from open_data_export.config import Settings
+#from open_data_export.config import settings
 from open_data_export.main import (
     ping,
     reset_queue,
@@ -37,6 +36,5 @@ ping({},{})
 #     print(f"{day['day']}; {day['sensor_nodes_id']}")
 #     data = get_measurement_data(day['sensor_nodes_id'], day['day'])
 #     print(data)
-
 
 export_pending()
