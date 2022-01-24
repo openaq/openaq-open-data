@@ -24,7 +24,7 @@ from open_data_export.main import (
 #reset_queue()
 
 ## this will just check to see if things are working
-ping({},{})
+# ping({},{})
 
 ## get a list of pending days
 #days = get_pending_location_days()
@@ -37,4 +37,4 @@ ping({},{})
 #     data = get_measurement_data(day['sensor_nodes_id'], day['day'])
 #     print(data)
 
-#export_pending()
+export_pending({"method":"ping2"},{})

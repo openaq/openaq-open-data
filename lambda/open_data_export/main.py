@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 logging.basicConfig(
     format = '[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s',
-    level = settings.LOG_LEVEL,
+    level = settings.LOG_LEVEL.upper(),
     force = True,
 )
 
@@ -63,7 +63,7 @@ def reset_queue():
     db = get_database()
     return db.rows(sql, response_format='DataFrame')
 
-def update_export_log(day: str, node: int, n: int):
+def update_export_log(day: str, node: int, n: int, sec: int):
     """Mark the location/day as exported"""
     if isinstance(day, str):
         day = datetime.fromisoformat(day).date()
@@ -71,7 +71,7 @@ def update_export_log(day: str, node: int, n: int):
     SELECT update_export_log_exported(:day, :node, :n)
     """
     db = get_database()
-    return db.rows(sql, day = day, node = node, n = n)
+    return db.rows(sql, day = day, node = node, n = n, sec = sec)
 
 def get_all_location_days():
     """get the entire set of location/days."""
@@ -115,7 +115,8 @@ def get_measurement_data(
         day = datetime.fromisoformat(day).date()
 
     where = {
-        'day': day,
+        'day1': day,
+        'day2': day,
         'sensor_nodes_id': f"{sensor_nodes_id}",
     }
 
@@ -135,9 +136,10 @@ def get_measurement_data(
     , value
     , lon
     , lat
-    FROM measurement_data_export
+    FROM measurement_data_export2
     WHERE sensor_nodes_id = :sensor_nodes_id
-    AND (datetime - '1sec'::interval)::date = :day
+    AND datetime > (:day1 - utc_offset)
+    AND datetime <= (:day2 + '1day'::interval + utc_offset)
     --LIMIT 5
     """
     db = get_database()
@@ -198,7 +200,7 @@ def write_file(tbl, filepath: str = 'example'):
         raise Exception(f"{settings.WRITE_FILE_LOCATION} is not a valid location")
 
 
-def export_data(day, node, range = 'day'):
+def export_data(day, node):
     try:
         start = time.time()
         rows = get_measurement_data(
@@ -212,16 +214,22 @@ def export_data(day, node, range = 'day'):
         dy = day.strftime('%d')
         filepath = f"records/{settings.WRITE_FILE_FORMAT}/country={country}/locationid={node}/year={yr}/month={mn}/location-{node}-{yr}{mn}{dy}"
         write_file(df, filepath)
-        update_export_log(day, node, len(rows))
+        sec = time.time() - start
+        logger.info("export_data: %s rows; %0.4f seconds", len(rows), sec)
+        update_export_log(day, node, len(rows), sec)
     except Exception as e:
         logger.warning(f"Error processing {node}-{day}-{settings.OPEN_DATA_BUCKET}: {e}");
-    finally:
-        logger.info("export_data: %0.4f", time.time() - start)
+        raise
 
 def export_pending(event = {}, context = {}):
     """Only export the location/days that are marked for export. Location days will be limited to the value in the LIMIT environmental parameter"""
     if 'source' not in event.keys():
         event['source'] = 'not set'
+
+    if 'method' in event.keys():
+        if event['method'] == 'ping':
+            return ping(event, context)
+
     start = time.time()
     days = get_pending_location_days()
     for d in days:
@@ -232,7 +240,7 @@ def export_pending(event = {}, context = {}):
         time.time() - start,
         event['source'],
     )
-    return days
+    return len(days)
 
 def export_all():
     """Export all location/days in the database. This will reset the export log and then run the `export_pending` method."""

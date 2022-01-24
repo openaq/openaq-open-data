@@ -41,9 +41,9 @@ DATABASE_DB=postgres
 
 # Installing
 You will need to install a few different parts to get this working.
-1. Update your database to include the export module (see `tables/exports.sql` and `idempotent/exports_views.sql` in the `openaq-db` repository).
+1. Update your database to include the export module (see `tables/exports.sql` and `idempotent/exports_views.sql` in the `openaq-db` repository). There is a [patch](schema/schema.sql) file to help with this but you may need to adjust the paths.
 2. Update the `openaq-api-v2` ingest process to include the new `lcs_meas_ingest.sql` file.
-3. Install the function and event using the AWS CDK process
+3. Install the function and event using the AWS CDK process (see [README](cdk/README.md))
 
 
 [^improvements]: It might make sense to update the `get_pending` query to also pull down any abandoned queued location days, though this would only happen if the process times out.

@@ -12,6 +12,7 @@ from aws_cdk import (
     aws_logs as _logs,
     aws_s3 as _s3,
     aws_events_targets as _targets,
+    aws_iam as _iam,
     Stack,
     Environment,
     Duration,
@@ -73,7 +74,7 @@ class OpenDataStack(Stack):
             code = package,
             handler = 'open_data_export.main.export_pending',
             environment = environment,
-            memory_size = 1512,
+            memory_size = 512,
             log_retention = _logs.RetentionDays.ONE_WEEK,
             timeout = Duration.seconds(900),
         )
@@ -81,7 +82,7 @@ class OpenDataStack(Stack):
         rule = _events.Rule(
             self,
             f"{id}-event-rule",
-            schedule = _events.Schedule.cron(minute="0/5"),
+            schedule = _events.Schedule.cron(minute="0/1"),
             targets = [
                 _targets.LambdaFunction(exportPendingLambda),
             ],
@@ -110,6 +111,12 @@ cac = OpenDataStack(
     app,
     "cac-open-data",
     environment = dotenv_values(Path.joinpath(code_dir.parent.absolute(), ".env.cac")),
+)
+
+openaq = OpenDataStack(
+    app,
+    "openaq-open-data",
+    environment = dotenv_values(Path.joinpath(code_dir.parent.absolute(), ".env.openaq")),
 )
 
 app.synth()
