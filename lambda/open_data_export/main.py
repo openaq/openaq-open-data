@@ -136,7 +136,7 @@ def get_measurement_data(
     , value
     , lon
     , lat
-    FROM measurement_data_export2
+    FROM measurement_data_export
     WHERE sensor_nodes_id = :sensor_nodes_id
     AND datetime > (:day1 - utc_offset)
     AND datetime <= (:day2 + '1day'::interval + utc_offset)
