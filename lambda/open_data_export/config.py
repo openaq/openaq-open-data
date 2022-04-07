@@ -1,14 +1,16 @@
 from typing import Optional
 from pydantic import BaseSettings, validator
 from pathlib import Path
+import os
 from os import environ
+
 
 class Settings(BaseSettings):
     LOG_LEVEL: str = 'DEBUG'
     LIMIT: int = 500
     LOCAL_SAVE_DIRECTORY: str = ''
-    WRITE_FILE_LOCATION: str = 's3' # local
-    WRITE_FILE_FORMAT: str = 'csv' # parquet, json
+    WRITE_FILE_LOCATION: str = 's3'  # local
+    WRITE_FILE_FORMAT: str = 'csv'  # parquet, json
     OPEN_DATA_BUCKET: str = 'openaq-open-data-testing'
     DATABASE_READ_USER: str = 'postgres'
     DATABASE_READ_PASSWORD: str = 'postgres'
@@ -32,16 +34,18 @@ class Settings(BaseSettings):
 
     class Config:
         try:
-            env_path = Path(__file__).parents[2]
-            #env_path = Path(__file__).resolve().parent
+            parent = Path(__file__).parents[2]
+            # env_path = Path(__file__).resolve().parent
         except Exception:
             # If we are not running as a script
-            env_path = Path(os.getcwd())
+            parent = Path(os.getcwd())
 
-        if 'OPEN_DATA_DOT_ENV' in environ:
-            env_file=Path.joinpath(env_path, environ['OPEN_DATA_DOT_ENV'])
+        if 'DOTENV' in environ:
+            env_file = Path.joinpath(parent, environ['DOTENV'])
+        elif 'ENV' in environ:
+            env_file = Path.joinpath(parent, f".env.{environ['ENV']}")
         else:
-            env_file=Path.joinpath(env_path, ".env")
+            env_file = Path.joinpath(parent, ".env")
 
 
 settings = Settings()

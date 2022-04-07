@@ -2,7 +2,6 @@ import psycopg
 import time
 import logging
 
-#from config import settings
 from open_data_export.config import settings
 from buildpg import render
 from pandas import DataFrame
@@ -11,8 +10,9 @@ import re
 
 logger = logging.getLogger(__name__)
 
+
 class DB:
-    response_format = 'Record' ## json, dataframe
+    response_format = 'Record'
     query_time = 0
 
     def __init__(self, response_format: str = 'Record'):
@@ -59,7 +59,7 @@ class DB:
                     logger.info("query: seconds: %0.4f, results: %s", dur, n)
                     return data, fields, n
                 except Exception as e:
-                    logger.warning(f"Query error: {e}");
+                    logger.warning(f"Query error: {e}")
                     raise ValueError(f"{e}") from None
                 finally:
                     conn.commit()
@@ -70,7 +70,10 @@ class DB:
             response_format: str = 'default',
             **kwargs
     ):
-        data, fields, n = self.__query(query, params = kwargs, method='rows')
+        data, fields, n = self.__query(
+            query,
+            params=kwargs, method='rows'
+        )
         if response_format == 'DataFrame' or self.response_format == 'DataFrame':
             data = DataFrame(data, columns=fields)
         return data
@@ -81,7 +84,10 @@ class DB:
             response_format: str = 'default',
             **kwargs
     ):
-        data, fields, n = self.__query(query, params = kwargs, method='row')
+        data, fields, n = self.__query(
+            query,
+            params=kwargs, method='row'
+        )
         if response_format == 'DataFrame' or self.response_format == 'DataFrame':
             print(fields)
             data = DataFrame([data], columns=fields)

@@ -2,7 +2,6 @@ import asyncpg
 import time
 import logging
 
-#from config import settings
 from open_data_export.config import settings
 from buildpg import render
 from pandas import DataFrame
@@ -10,9 +9,10 @@ import orjson
 
 logger = logging.getLogger(__name__)
 
+
 class DB:
     pg_pool = None
-    response_format = 'Record' ## json, dataframe
+    response_format = 'Record'
     query_time = 0
 
     def __init__(self, response_format: str = 'Record'):
@@ -22,13 +22,12 @@ class DB:
         if self.pg_pool is None:
             self.pg_pool = await asyncpg.create_pool(
                 settings.DATABASE_WRITE_URL,
-                command_timeout=200,
+                command_timeout=14,
                 max_inactive_connection_lifetime=15,
                 min_size=1,
                 max_size=10,
             )
         return self.pg_pool
-
 
     async def __query(
             self,
