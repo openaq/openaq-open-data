@@ -14,7 +14,6 @@ from datetime import datetime
 from io import StringIO, BytesIO
 from typing import Union
 import boto3
-import json
 
 logger = logging.getLogger(__name__)
 
@@ -84,22 +83,30 @@ def object_exists(Bucket: str, Key: str):
 
 def move_object(from_location, to_location):
     try:
+        if (to_location['Bucket'] != from_location['Bucket'] or to_location['Key'] != from_location['Key']):
+            s3.copy_object(
+                Bucket=to_location['Bucket'],
+                Key=to_location['Key'],
+                ACL='public-read',
+                CopySource={
+                    'Bucket': from_location['Bucket'],
+                    'Key': from_location['Key'],
+                },
+            )
+            logger.debug(f"Copied: {to_location['Bucket']}/{to_location['Key']}")
+            s3.delete_object(
+               Bucket=from_location['Bucket'],
+               Key=from_location['Key'],
+            )
+            logger.debug(f"Deleted: {from_location['Bucket']}/{from_location['Key']}")
+        else:
+            # if its the same lets just update the ACL policy
+            s3.put_object_acl(
+                Bucket=to_location['Bucket'],
+                Key=to_location['Key'],
+                ACL='public-read',
+            )
 
-        s3.copy_object(
-            Bucket=to_location['Bucket'],
-            Key=to_location['Key'],
-            CopySource={
-                'Bucket': from_location['Bucket'],
-                'Key': from_location['Key'],
-            },
-        )
-
-        s3.delete_object(
-           Bucket=from_location['Bucket'],
-           Key=from_location['Key'],
-        )
-
-        logger.debug(f"Moved: {to_location['Bucket']}/{to_location['Key']}")
         return True
 
     except s3.exceptions.NoSuchKey:
@@ -109,12 +116,35 @@ def move_object(from_location, to_location):
         )
         if not new_exists:
             raise
+    except Exception as err:
+        # its possible that we are trying to move a file to itself, possibly
+        # to update its metadata. If it doesnt this will
+        # protect from that error
+        if 'without changing' in str(err):
+            logger.debug(f"{str(err)}")
+            return True
+        logger.warning(err)
+        return True
 
 
 def move_objects_handler(event, context=None):
     start = time.time()
     db = get_database()
-    limit = event['limit']
+    limit = 5000
+    where = "exported_on IS NOT NULL"
+    args = {}
+
+    if 'limit' in event.keys():
+        limit = event['limit']
+
+    if 'day' in event.keys():
+        args['day'] = datetime.fromisoformat(event['day']).date()
+        where += " AND l.day = :day"
+
+    if 'node' in event.keys():
+        args['node'] = event['node']
+        where += " AND l.sensor_nodes_id = :node"
+
     # determine the extension type
     if settings.WRITE_FILE_FORMAT == 'csv':
         ext = 'csv'
@@ -127,9 +157,14 @@ def move_objects_handler(event, context=None):
     else:
         raise Exception(f"We are not supporting {settings.WRITE_FILE_FORMAT}")
 
+    # where = " AND l.metadata->>'Bucket' IS NOT NULL"
+
     days = db.rows(
         f"""
         WITH days AS (
+        -----------
+        -- get a set of files to move
+        -----------
         SELECT
           l.day
         , l.sensor_nodes_id
@@ -145,36 +180,54 @@ def move_objects_handler(event, context=None):
           , l.sensor_nodes_id
           , to_char(l.day, 'YYYYMMDD')
         ) as key
+        , l.metadata->>'Key' as current_key
+        , l.metadata->>'error' as current_error
         FROM open_data_export_logs l
         JOIN sensor_nodes sn ON (l.sensor_nodes_id = sn.sensor_nodes_id)
         JOIN providers p ON (sn.source_name = p.source_name)
-        WHERE exported_on IS NOT NULL
-        AND l.metadata->>'bucket' IS NULL
+        WHERE {where}
         LIMIT {limit})
+        -----------
+        -- Update those records and return data
+        -----------
         UPDATE open_data_export_logs
-        SET metadata = jsonb_build_object(
+        SET metadata = COALESCE(metadata::jsonb, '{{}}'::jsonb)
+        ||jsonb_build_object(
            'Bucket', '{settings.OPEN_DATA_BUCKET}'
-           , 'Key', key
+          ,'Key', key
         )
         FROM days
-        WHERE days.open_data_export_logs_id = open_data_export_logs.open_data_export_logs_id
+        WHERE days.open_data_export_logs_id =
+              open_data_export_logs.open_data_export_logs_id
+        -----------
+        -- return the pre-update data
+        -----------
         RETURNING days.*;
-        """)
+        """, **args)
 
+    successes = 0
     for row in days:
 
         node = row[1]
         country = row[2]
         day = row[0]
         key = row[5]
+        old_key = row[6]
 
         yr = day.strftime('%Y')
         mn = day.strftime('%m')
         dy = day.strftime('%d')
 
-        old_key = f"""records/{settings.WRITE_FILE_FORMAT}/country={country}/locationid={node}/year={yr}/month={mn}/location-{node}-{yr}{mn}{dy}.{ext}"""
+        if row[7] is not None:
+            logger.info(f"Previous error: {row[7]}")
+
+        if old_key is None:
+            old_key = f"""records/{settings.WRITE_FILE_FORMAT}/country={country}/locationid={node}/year={yr}/month={mn}/location-{node}-{yr}{mn}{dy}.{ext}"""
 
         try:
+            logger.info(old_key)
+            logger.info(key)
+
             move_object(
                 from_location={
                     "Bucket": settings.OPEN_DATA_BUCKET,
@@ -185,12 +238,13 @@ def move_objects_handler(event, context=None):
                     "Key": key,
                 }
             )
+            successes += 1
         except Exception as e:
             logger.warning(f"{e}")
             submit_error(day, node, f"{e}")
 
     sec = time.time() - start
-    logger.info(f'Moved {limit} files in {sec} seconds')
+    logger.info(f'Moved {successes} files (of {len(days)}) in {sec} seconds')
 
 
 def update_export_log(
@@ -232,13 +286,16 @@ def submit_error(day: str, node: int, error: str):
         day = datetime.fromisoformat(day).date()
     sql = """
     UPDATE open_data_export_logs
-    SET metadata = :error
+    SET metadata = (COALESCE(metadata::jsonb, '{}'::jsonb)||jsonb_build_object(
+      'error', true
+    , 'message', (:error)::text
+    , 'at', current_timestamp::text
+    ))::json
     WHERE day = :day AND sensor_nodes_id = :node
     RETURNING open_data_export_logs_id
     """
-    error = {"error": True, "message": error}
     db = get_database()
-    return db.rows(sql, day=day, node=node, error=json.dumps(error))
+    return db.rows(sql, day=day, node=node, error=error)
 
 
 def get_all_location_days():

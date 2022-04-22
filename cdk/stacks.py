@@ -87,14 +87,14 @@ class MoveStack(Stack):
             timeout=Duration.seconds(900),
         )
 
-        # rule = _events.Rule(
-        #     self,
-        #     f"{id}-event-rule",
-        #     schedule=_events.Schedule.cron(minute="0/1"),
-        #     targets=[
-        #         _targets.LambdaFunction(exportPendingLambda),
-        #     ],
-        # )
+        _events.Rule(
+            self,
+            f"{id}-move-objects-rule",
+            schedule=_events.Schedule.cron(minute="0/1"),
+            targets=[
+                _targets.LambdaFunction(moveLambda),
+            ],
+        )
 
         bucket = _s3.Bucket.from_bucket_name(
             self,
