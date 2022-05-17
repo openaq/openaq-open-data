@@ -59,6 +59,54 @@ class ExportStack(Stack):
         bucket.grant_put_acl(exportPendingLambda)
 
 
+class UpdateStack(Stack):
+    def __init__(
+        self,
+        scope: Construct,
+        id: str,
+        package_directory: str,
+        env_variables: dict = {},
+        **kwargs,
+    ) -> None:
+        """Define stack."""
+        super().__init__(scope, id, **kwargs)
+
+        package = _lambda.Code.from_asset(
+            str(pathlib.Path.joinpath(package_directory, "package.zip"))
+        )
+
+        updateOutdatedLambda = _lambda.Function(
+            self,
+            f"{id}-update-outdated-lambda",
+            runtime=_lambda.Runtime.PYTHON_3_8,
+            code=package,
+            handler='open_data_export.main.update_outdated',
+            environment=env_variables,
+            memory_size=512,
+            log_retention=_logs.RetentionDays.ONE_WEEK,
+            timeout=Duration.seconds(900),
+        )
+
+        rule = _events.Rule(
+            self,
+            f"{id}-update-outdated-event-rule",
+            schedule=_events.Schedule.cron(minute="0/5"),
+            targets=[
+                _targets.LambdaFunction(updateOutdatedLambda),
+            ],
+        )
+
+        bucket = _s3.Bucket.from_bucket_name(
+            self,
+            "{id}-openaq-open-data-exports",
+            env_variables['OPEN_DATA_BUCKET'],
+        )
+
+        print(rule)
+        bucket.grant_put(updateOutdatedLambda)
+        bucket.grant_put_acl(updateOutdatedLambda)
+
+
 class MoveStack(Stack):
     def __init__(
         self,

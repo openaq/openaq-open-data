@@ -40,5 +40,5 @@ from open_data_export.main import (
 #     print(data)
 
 # export_pending()
-day = datetime.fromisoformat('2022-02-23').date()
-export_data(day, 65425)
+#day = datetime.fromisoformat('2022-02-23').date()
+#export_data(day, 65425)

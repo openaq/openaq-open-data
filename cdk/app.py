@@ -13,6 +13,7 @@ from aws_cdk import (
 from stacks import (
     ExportStack,
     MoveStack,
+    UpdateStack,
 )
 
 
@@ -71,6 +72,17 @@ openaq = ExportStack(
 move = MoveStack(
     app,
     "openaq-move-objects",
+    package_directory=code_dir,
+    env_variables=dotenv_values(
+        Path.joinpath(code_dir.parent.absolute(), ".env.openaq")
+    ),
+)
+Tags.of(move).add("Project", 'openaq')
+
+
+update = UpdateStack(
+    app,
+    "openaq-open-data-update",
     package_directory=code_dir,
     env_variables=dotenv_values(
         Path.joinpath(code_dir.parent.absolute(), ".env.openaq")

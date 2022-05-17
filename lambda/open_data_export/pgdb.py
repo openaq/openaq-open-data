@@ -8,7 +8,7 @@ from pandas import DataFrame
 import orjson
 import re
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('db')
 
 
 class DB:
@@ -56,7 +56,7 @@ class DB:
                     n = cur.rowcount
                     dur = time.time() - start
                     self.query_time += dur
-                    logger.info("query: seconds: %0.4f, results: %s", dur, n)
+                    logger.debug("query: seconds: %0.4f, results: %s", dur, n)
                     return data, fields, n
                 except Exception as e:
                     logger.warning(f"Query error: {e}")

@@ -1,5 +1,6 @@
 import logging
 import os
+import csv
 
 from open_data_export.pgdb import DB
 from open_data_export.config import settings
@@ -29,6 +30,9 @@ logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 s3 = boto3.client("s3")
 db = None
+# Iterate the version number when when a change is made
+# version number must be an integer
+FILE_FORMAT_VERSION = 1
 
 
 def get_database():
@@ -123,8 +127,7 @@ def move_object(from_location, to_location):
         if 'without changing' in str(err):
             logger.debug(f"{str(err)}")
             return True
-        logger.warning(err)
-        return True
+        raise
 
 
 def move_objects_handler(event, context=None):
@@ -132,16 +135,17 @@ def move_objects_handler(event, context=None):
     db = get_database()
     limit = 5000
     where = "exported_on IS NOT NULL"
+    # AND (l.metadata->>'move' IS NOT NULL AND (l.metadata->>'move')::boolean = true)
     args = {}
 
-    if 'limit' in event.keys():
+    if 'limit' in event.keys() and event['limit'] is not None:
         limit = event['limit']
 
-    if 'day' in event.keys():
+    if 'day' in event.keys() and event['day'] is not None:
         args['day'] = datetime.fromisoformat(event['day']).date()
         where += " AND l.day = :day"
 
-    if 'node' in event.keys():
+    if 'node' in event.keys() and event['node'] is not None:
         args['node'] = event['node']
         where += " AND l.sensor_nodes_id = :node"
 
@@ -182,6 +186,7 @@ def move_objects_handler(event, context=None):
         ) as key
         , l.metadata->>'Key' as current_key
         , l.metadata->>'error' as current_error
+        , l.metadata->>'message' as current_error_message
         FROM open_data_export_logs l
         JOIN sensor_nodes sn ON (l.sensor_nodes_id = sn.sensor_nodes_id)
         JOIN providers p ON (sn.source_name = p.source_name)
@@ -195,6 +200,9 @@ def move_objects_handler(event, context=None):
         ||jsonb_build_object(
            'Bucket', '{settings.OPEN_DATA_BUCKET}'
           ,'Key', key
+          ,'move', false
+          ,'error', false
+          ,'message', 'no error'
         )
         FROM days
         WHERE days.open_data_export_logs_id =
@@ -219,15 +227,12 @@ def move_objects_handler(event, context=None):
         dy = day.strftime('%d')
 
         if row[7] is not None:
-            logger.info(f"Previous error: {row[7]}")
+            logger.debug(f"Previous error: {row[8]}")
 
-        if old_key is None:
-            old_key = f"""records/{settings.WRITE_FILE_FORMAT}/country={country}/locationid={node}/year={yr}/month={mn}/location-{node}-{yr}{mn}{dy}.{ext}"""
+        # if old_key is None:
+        old_key = f"""records/{settings.WRITE_FILE_FORMAT}/country={country}/locationid={node}/year={yr}/month={mn}/location-{node}-{yr}{mn}{dy}.{ext}"""
 
         try:
-            logger.info(old_key)
-            logger.info(key)
-
             move_object(
                 from_location={
                     "Bucket": settings.OPEN_DATA_BUCKET,
@@ -268,14 +273,23 @@ def update_export_log(
       'Bucket', (:bucket)::text
     , 'Key', (:key)::text
     , 'sec', (:sec)::numeric
+    , 'version', :version
     )
     WHERE day = :day
     AND sensor_nodes_id = :node
     RETURNING open_data_export_logs_id
     """
     db = get_database()
-    return db.rows(sql, day=day, node=node,
-                   n=n, sec=sec, bucket=bucket, key=key)
+    return db.rows(
+        sql,
+        day=day,
+        node=node,
+        n=n,
+        sec=sec,
+        bucket=bucket,
+        key=key,
+        version=FILE_FORMAT_VERSION
+    )
 
 
 def submit_error(day: str, node: int, error: str):
@@ -331,6 +345,17 @@ def get_pending_location_days():
     return db.rows(sql)
 
 
+def get_outdated_location_days():
+    """
+    get the set of location/days that are old and need to be updated
+    """
+    sql = f"""
+    SELECT * FROM outdated_location_days({FILE_FORMAT_VERSION}, {settings.LIMIT})
+    """
+    db = get_database()
+    return db.rows(sql)
+
+
 def get_measurement_data(
         sensor_nodes_id: int,
         day: Union[str, datetime.date],
@@ -361,7 +386,7 @@ def get_measurement_data(
     , ismobile
     , sensor
     , datetime_str as datetime
-    , measurand
+    , measurand as parameter
     , units
     , value
     , lon
@@ -399,7 +424,7 @@ def write_file(tbl, filepath: str = 'example'):
         out = StringIO()
         ext = 'csv'
         mode = 'w'
-        tbl.to_csv(out, index=False)
+        tbl.to_csv(out, index=False, quoting=csv.QUOTE_NONNUMERIC)
     elif settings.WRITE_FILE_FORMAT == 'csv.gz':
         logger.debug('writing file to csv.gz format')
         out = BytesIO()
@@ -446,46 +471,48 @@ def write_file(tbl, filepath: str = 'example'):
 
 def export_data(day, node):
     start = time.time()
-    rows = get_measurement_data(
-        sensor_nodes_id=node,
-        day=day,
-    )
-    if len(rows) > 0:
-        country = rows['country'][0]
-        provider = rows['provider'][0]
-        df = reshape(
-            rows,
-            fields=[
-                "location_id",
-                "sensors_id",
-                "location",
-                "datetime",
-                "lat",
-                "lon",
-                "measurand",
-                "units",
-                "value"
-            ]
+    yr = day.strftime('%Y')
+    mn = day.strftime('%m')
+    dy = day.strftime('%d')
+
+    try:
+        rows = get_measurement_data(
+            sensor_nodes_id=node,
+            day=day,
         )
-        yr = day.strftime('%Y')
-        mn = day.strftime('%m')
-        dy = day.strftime('%d')
-        bucket = settings.OPEN_DATA_BUCKET
-        filepath = f"""records/{settings.WRITE_FILE_FORMAT}/provider={provider}/country={country}/locationid={node}/year={yr}/month={mn}/location-{node}-{yr}{mn}{dy}"""
-        write_file(df, filepath)
+
+        if len(rows) > 0:
+            country = rows['country'][0]
+            provider = rows['provider'][0]
+            df = reshape(
+                rows,
+                fields=[
+                    "location_id",
+                    "sensors_id",
+                    "location",
+                    "datetime",
+                    "lat",
+                    "lon",
+                    "parameter",
+                    "units",
+                    "value"
+                ]
+            )
+            bucket = settings.OPEN_DATA_BUCKET
+            filepath = f"""records/{settings.WRITE_FILE_FORMAT}/provider={provider}/country={country}/locationid={node}/year={yr}/month={mn}/location-{node}-{yr}{mn}{dy}"""
+            write_file(df, filepath)
+        else:
+            filepath = None
+            bucket = None
+
         sec = time.time() - start
         update_export_log(day, node, len(rows), sec, bucket, filepath)
         logger.info(
             "export_data: location: %s, day: %s; %s rows; %0.4f seconds",
             node, f"{yr}-{mn}-{dy}", len(rows), sec
         )
-    else:
-        error = "query returned 0 records"
-        logger.info(
-            "export_data: location: %s, day: %s; error: %s",
-            node, f"{yr}-{mn}-{dy}", error
-        )
-        submit_error(day, node, error)
+    except Exception as e:
+        submit_error(day, node, str(e))
 
 
 def export_pending(event={}, context={}):
@@ -510,6 +537,32 @@ def export_pending(event={}, context={}):
 
     logger.info(
         "export_pending: %s; seconds: %0.4f; source: %s",
+        len(days),
+        time.time() - start,
+        event['source'],
+    )
+    return len(days)
+
+
+def update_outdated(event={}, context={}):
+    """
+    Only export the location/days that are marked for export. Location days
+    will be limited to the value in the LIMIT environmental parameter
+    """
+    if 'source' not in event.keys():
+        event['source'] = 'not set'
+
+    start = time.time()
+    days = get_outdated_location_days()
+
+    for d in days:
+        try:
+            export_data(d[1], d[0])
+        except Exception as e:
+            logger.warning(f"Error processing {d[0]}-{d[1]}: {e}")
+
+    logger.info(
+        "update_outdated: %s; seconds: %0.4f; source: %s",
         len(days),
         time.time() - start,
         event['source'],

@@ -39,3 +39,4 @@ args = parser.parse_args()
 print(vars(args))
 
 move_objects_handler(vars(args))
+# move_objects_handler({})
