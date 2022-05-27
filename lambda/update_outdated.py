@@ -12,6 +12,6 @@ args = parser.parse_args()
 
 environ['LIMIT'] = str(args.limit)
 
-from open_data_export.main import update_outdated
+from open_data_export.main import update_outdated_handler
 
-update_outdated({'source': 'testing-cp'})
+update_outdated_handler({'source': 'testing-cp'})

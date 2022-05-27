@@ -16,7 +16,7 @@ from io import StringIO, BytesIO
 from typing import Union
 import boto3
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('main')
 
 logging.basicConfig(
     format='[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s',
@@ -245,7 +245,6 @@ def move_objects_handler(event, context=None):
             )
             successes += 1
         except Exception as e:
-            logger.warning(f"{e}")
             submit_error(day, node, f"{e}")
 
     sec = time.time() - start
@@ -308,6 +307,7 @@ def submit_error(day: str, node: int, error: str):
     WHERE day = :day AND sensor_nodes_id = :node
     RETURNING open_data_export_logs_id
     """
+    logger.error(f"error: {node} on {day} - {error}")
     db = get_database()
     return db.rows(sql, day=day, node=node, error=error)
 
@@ -354,6 +354,79 @@ def get_outdated_location_days():
     """
     db = get_database()
     return db.rows(sql)
+
+
+def get_measurement_data_b(
+        sensor_nodes_id: int,
+        day: Union[str, datetime.date],
+):
+    """
+    Pull all measurement data for one site and day.
+    Data is organized by sensor_node and the sensor_systems_id
+    and units is appended to the measurand to ensure that
+    there will be no duplicate columns when we convert to long format
+    """
+    # db = get_database()
+    if isinstance(day, str):
+        day = datetime.fromisoformat(day).date()
+
+    # where = {
+    #     'day1': day,
+    #     'day2': day,
+    #     'sensor_nodes_id': f"{sensor_nodes_id}",
+    # }
+
+    # Start by getting the sensor node data
+    db = get_database()
+    sn = db.rows(f"""
+    SELECT array_agg(sensors_id)
+    FROM sensors s
+    JOIN sensor_systems sy ON (s.sensor_systems_id = sy.sensor_systems_id)
+    JOIN sensor_nodes sn ON (sy.sensor_nodes_id = sn.sensor_nodes_id)
+    WHERE sn.sensor_nodes_id = {sensor_nodes_id}
+    """)
+
+    #sn = [[[899869, 899870, 899871, 417082, 417083, 417084]]]
+    #sn = [[[899869]]]
+    logger.info(sn[0][0][0])
+    # AND (m.datetime - '1sec'::interval)::date = :day
+    # , p.measurand||'-'||ss.sensor_systems_id||'-'||p.units as measurand
+    # sql = """
+    # SELECT *
+    # FROM measurements
+    # WHERE sensors_id = ANY(:sensors_id)
+    # AND datetime > timezone(tz, (:day1)::timestamp)
+    # AND datetime <= timezone(tz, :day2 + '1day'::interval)
+    # """
+
+    #
+
+    sql = """
+    SELECT *
+    FROM measurements m
+    JOIN (VALUES (889248), (899870), (889250), (415649), (415648), (415650)) as t(sensors_id) ON (m.sensors_id = t.sensors_id)
+    WHERE  TRUE -- sensors_id = :sensors_id
+    AND datetime > (:day1)::timestamp
+    AND datetime <= :day2 + '1day'::interval
+    """
+
+    logger.debug(
+        f'Getting measurement data for {sensor_nodes_id} for {day}'
+    )
+
+    rows = db.rows(
+        sql,
+        day1=day,
+        day2=day,
+        sensors_id=sn[0][0][0],
+        response_format='DataFrame'
+    )
+
+    raise Exception(
+        f"TESTING EXPORT METHODS"
+    )
+
+    return rows
 
 
 def get_measurement_data(
@@ -544,6 +617,42 @@ def export_pending(event={}, context={}):
     return len(days)
 
 
+def update_outdated_handler(event=None, context=None):
+    """
+    Run the updater repeatedly until there is not enough time left
+    """
+    time_spent = 0
+    if context is not None:
+        time_available = context.get_remaining_time_in_millis()/1000
+    else:
+        time_available = 120
+
+    time_left = time_available
+    days = 0
+    start = time.time()
+
+    while time_spent <= time_left:
+        logger.info(
+            "update_outdated_handler: time spent: %0.2f, time left: %0.2f",
+            time_spent,
+            time_left,
+        )
+        method_start = time.time()
+        days += update_outdated(event, context)
+        time_spent = time.time() - method_start
+        time_left = time_available - (time.time() - start)
+
+    logger.info(
+        "update_outdated_handler: days: %s, seconds: %0.2f, time spent: %0.2f, time left: %0.2f",
+        days,
+        time.time() - start,
+        time_spent,
+        time_left,
+    )
+
+    return days
+
+
 def update_outdated(event={}, context={}):
     """
     Only export the location/days that are marked for export. Location days
@@ -553,7 +662,14 @@ def update_outdated(event={}, context={}):
         event['source'] = 'not set'
 
     start = time.time()
+
     days = get_outdated_location_days()
+    logger.info(
+        "get_outdated: %s rows; seconds: %0.4f; source: %s",
+        settings.LIMIT,
+        time.time() - start,
+        event['source'],
+    )
 
     for d in days:
         try:
@@ -567,6 +683,7 @@ def update_outdated(event={}, context={}):
         time.time() - start,
         event['source'],
     )
+
     return len(days)
 
 

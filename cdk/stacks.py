@@ -80,7 +80,7 @@ class UpdateStack(Stack):
             f"{id}-update-outdated-lambda",
             runtime=_lambda.Runtime.PYTHON_3_8,
             code=package,
-            handler='open_data_export.main.update_outdated',
+            handler='open_data_export.main.update_outdated_handler',
             environment=env_variables,
             memory_size=512,
             log_retention=_logs.RetentionDays.ONE_WEEK,
@@ -90,7 +90,7 @@ class UpdateStack(Stack):
         rule = _events.Rule(
             self,
             f"{id}-update-outdated-event-rule",
-            schedule=_events.Schedule.cron(minute="0/5"),
+            schedule=_events.Schedule.cron(minute="0/15"),
             targets=[
                 _targets.LambdaFunction(updateOutdatedLambda),
             ],
