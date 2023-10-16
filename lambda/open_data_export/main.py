@@ -3,6 +3,7 @@ import os
 import csv
 import gzip
 
+from multiprocessing import Process, Pool
 from open_data_export.pgdb import DB
 from open_data_export.config import settings
 from smart_open import open
@@ -748,6 +749,10 @@ def export_data(day, node):
     except Exception as e:
         submit_error(day, node, str(e))
 
+def export_data_mp(p):
+    logger.info(f"Starting {p[0]}/{p[1]} on pid: {os.getpid()}")
+    n, sec = export_data(p[1], p[0])
+    return sec
 
 def export_pending():
     """
@@ -756,12 +761,10 @@ def export_pending():
     """
     start = time.time()
     days, time_ms = get_pending_location_days()
-    for d in days:
-        try:
-            logger.debug(f"{d[1]}/{d[0]}")
-            export_data(day=d[1], node=d[0])
-        except Exception as e:
-            logger.warning(f"Error processing {d[0]}-{d[1]}: {e}")
+
+    pool = Pool()
+    result = pool.map(export_data_mp, days)
+    pool.close()
 
     logger.info(
         "export_pending: %s; seconds: %0.4f;",
