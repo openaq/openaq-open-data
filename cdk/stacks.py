@@ -3,12 +3,22 @@ from aws_cdk import (
     aws_events as _events,
     aws_logs as _logs,
     aws_s3 as _s3,
+    aws_iam as _iam,
     aws_events_targets as _targets,
+    aws_ec2 as _ec2,
     Stack,
     Duration,
 )
 import pathlib
+
 from constructs import Construct
+
+from typing import Dict
+
+from utils import (
+    stringify_settings,
+    create_dependencies_layer,
+)
 
 
 class ExportStack(Stack):
@@ -17,32 +27,76 @@ class ExportStack(Stack):
         scope: Construct,
         id: str,
         package_directory: str,
+        env_name: str,
+        ingest_lambda_timeout: int,
+        ingest_lambda_memory_size: int,
         env_variables: dict = {},
+        vpc_id: str | None = None,
         **kwargs,
     ) -> None:
         """Define stack."""
         super().__init__(scope, id, **kwargs)
 
-        package = _lambda.Code.from_asset(
-            str(pathlib.Path.joinpath(package_directory, "package.zip"))
+        print(vpc_id)
+        if vpc_id not in [None, 'null']:
+            vpc = _ec2.Vpc.from_lookup(
+                self,
+                f"{id}-exporter-vpc",
+                vpc_id=vpc_id,
+            )
+        else:
+            vpc = None
+
+        sg = _ec2.SecurityGroup(
+            self,
+            f"{id}-exporter-ssh-sg",
+            vpc=vpc,
+            allow_all_outbound=True,
         )
+
 
         exportPendingLambda = _lambda.Function(
             self,
             f"{id}-export-pending-lambda",
-            runtime=_lambda.Runtime.PYTHON_3_8,
-            code=package,
-            handler='open_data_export.main.export_pending',
-            environment=env_variables,
-            memory_size=512,
-            log_retention=_logs.RetentionDays.ONE_WEEK,
-            timeout=Duration.seconds(900),
+            runtime=_lambda.Runtime.PYTHON_3_9,
+            code=_lambda.Code.from_asset(
+                path='../lambda',
+                exclude=[
+                    'venv',
+                    '__pycache__',
+                    '.pytest_cache',
+                    '.hypothesis',
+                    'tests',
+                    '.build',
+                    'cdk',
+                    '*.pyc',
+                    '*.md',
+                    '.env*',
+                    '.gitignore',
+                    'logs',
+                    'move_files.py',
+                    'move_country_files.py',
+                ],
+            ),
+            vpc=vpc,
+            handler='open_data_export.main.handler',
+            environment=stringify_settings(env_variables),
+            memory_size=ingest_lambda_memory_size,
+            timeout=Duration.seconds(ingest_lambda_timeout),
+            layers=[
+                create_dependencies_layer(
+                    self,
+                    f"{env_name}",
+                    'update'
+                ),
+            ],
+            log_retention=_logs.RetentionDays.ONE_WEEK
         )
 
-        rule = _events.Rule(
+        _events.Rule(
             self,
             f"{id}-event-rule",
-            schedule=_events.Schedule.cron(minute="0/1"),
+            schedule=_events.Schedule.cron(minute="0/10"),
             targets=[
                 _targets.LambdaFunction(exportPendingLambda),
             ],
@@ -50,13 +104,23 @@ class ExportStack(Stack):
 
         bucket = _s3.Bucket.from_bucket_name(
             self,
-            "{id}-openaq-open-data-exports",
+            "{id}-openaq-exports-open-data-bucket",
             env_variables['OPEN_DATA_BUCKET'],
         )
 
-        print(rule)
         bucket.grant_put(exportPendingLambda)
         bucket.grant_put_acl(exportPendingLambda)
+
+        if env_variables['DB_BACKUP_BUCKET'] is not None:
+            db_backup_bucket = _s3.Bucket.from_bucket_name(
+                self,
+                "{id}-openaq-exports-db-backup-bucket",
+                env_variables['DB_BACKUP_BUCKET'],
+            )
+            db_backup_bucket.grant_put(exportPendingLambda)
+            db_backup_bucket.grant_put_acl(exportPendingLambda)
+
+
 
 
 class UpdateStack(Stack):
@@ -64,33 +128,62 @@ class UpdateStack(Stack):
         self,
         scope: Construct,
         id: str,
-        package_directory: str,
-        env_variables: dict = {},
+        bucket: str,
+        env_name: str,
+        lambda_env: Dict,
+        lambda_timeout: int = 900,
+        lambda_memory_size: int = 512,
+        rate_minutes: int = 5,
+        lambda_role_arn: str = None,
+        # package_directory: str,
+        # env_variables: dict = {},
         **kwargs,
     ) -> None:
         """Define stack."""
         super().__init__(scope, id, **kwargs)
 
-        package = _lambda.Code.from_asset(
-            str(pathlib.Path.joinpath(package_directory, "package.zip"))
-        )
+        lambda_role = None
+        if lambda_role_arn is not None:
+            print(f'looking up role: {lambda_role_arn}')
+            lambda_role = _iam.Role.from_role_arn(
+                self,
+                f"{id}-role",
+                role_arn=lambda_role_arn
+            )
 
         updateOutdatedLambda = _lambda.Function(
             self,
             f"{id}-update-outdated-lambda",
-            runtime=_lambda.Runtime.PYTHON_3_8,
-            code=package,
+            runtime=_lambda.Runtime.PYTHON_3_9,
+            code=_lambda.Code.from_asset(
+                path='../lambda',
+                exclude=[
+                    'venv',
+                    '__pycache__',
+                    'pytest_cache',
+                ],
+            ),
             handler='open_data_export.main.update_outdated_handler',
-            environment=env_variables,
-            memory_size=512,
+            memory_size=lambda_memory_size,
+            timeout=Duration.seconds(lambda_timeout),
+            environment=stringify_settings(lambda_env),
+            layers=[
+                create_dependencies_layer(
+                    self,
+                    f"{env_name}",
+                    'update'  # just use the same layer for now
+                ),
+            ],
             log_retention=_logs.RetentionDays.ONE_WEEK,
-            timeout=Duration.seconds(900),
+            role=lambda_role
         )
 
         rule = _events.Rule(
             self,
             f"{id}-update-outdated-event-rule",
-            schedule=_events.Schedule.cron(minute="0/15"),
+            schedule=_events.Schedule.cron(
+                minute=f"0/{rate_minutes}"
+            ),
             targets=[
                 _targets.LambdaFunction(updateOutdatedLambda),
             ],
@@ -99,7 +192,7 @@ class UpdateStack(Stack):
         bucket = _s3.Bucket.from_bucket_name(
             self,
             "{id}-openaq-open-data-exports",
-            env_variables['OPEN_DATA_BUCKET'],
+            bucket,
         )
 
         print(rule)
@@ -126,7 +219,7 @@ class MoveStack(Stack):
         moveLambda = _lambda.Function(
             self,
             f"{id}-move-objects-lambda",
-            runtime=_lambda.Runtime.PYTHON_3_8,
+            runtime=_lambda.Runtime.PYTHON_3_9,
             code=package,
             handler='open_data_export.main.move_objects_handler',
             environment=env_variables,

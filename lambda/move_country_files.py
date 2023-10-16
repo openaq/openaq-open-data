@@ -2,7 +2,6 @@
 import boto3
 import re
 from datetime import datetime
-from open_data_export.pgdb import DB
 from open_data_export.config import settings
 from open_data_export.main import move_objects_handler
 

@@ -11,7 +11,7 @@ import csv
 s3 = boto3.client("s3")
 bucket = 'openaq-logs'
 # Number of files per datetime to pull down, limit = 1000
-maxkeys = 25
+maxkeys = 5
 # The min and max dates to search from
 datetime_min = datetime.fromisoformat('2017-08-10 23:00')
 datetime_max = datetime.now()
@@ -28,7 +28,7 @@ pattern = "\[(?P<date>.+)\] (?P<ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) (?P<user>
 #######################
 # set of random dates to sample with
 dates = []
-for i in range(3):
+for i in range(300):
     mn = int(datetime_min.strftime('%s'))
     mx = int(datetime_max.strftime('%s'))
     dt = datetime.fromtimestamp(
@@ -44,7 +44,7 @@ for i in range(3):
 dates = []
 datetime_min = datetime.fromisoformat('2022-04-01')
 datetime_max = datetime.fromisoformat('2022-05-01')
-for i in range(10):
+for i in range(30):
     mn = int(datetime_min.strftime('%s'))
     mx = int(datetime_max.strftime('%s'))
     dt = datetime.fromtimestamp(

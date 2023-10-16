@@ -53,7 +53,8 @@ class DB:
                 dur = time.time() - start
                 self.query_time += dur
                 logger.info("query rows: seconds: %0.4f, results: %s", dur, n)
-                return data, fields, n
+                logger.debug(dur)
+                return data, fields, n, round(dur*1000)
             except Exception as e:
                 logger.warning(f"Query error: {e}");
                 raise ValueError(f"{e}") from None
@@ -67,10 +68,10 @@ class DB:
             response_format: str = 'default',
             **kwargs
     ):
-        data, fields, n = await self.__query(query, params = kwargs, method='rows')
+        data, fields, n, time_ms = await self.__query(query, params = kwargs, method='rows')
         if response_format == 'DataFrame' or self.response_format == 'DataFrame':
             data = DataFrame(data, columns=fields)
-        return data
+        return data, time_ms
 
     async def row(
             self,
@@ -78,11 +79,10 @@ class DB:
             response_format: str = 'default',
             **kwargs
     ):
-        data, fields, n = await self.__query(query, params = kwargs, method='row')
+        data, fields, n, time_ms = await self.__query(query, params = kwargs, method='row')
         if response_format == 'DataFrame' or self.response_format == 'DataFrame':
-            print(fields)
             data = DataFrame([data], columns=fields)
-        return data
+        return data, time_ms
 
     async def value(
             self,
@@ -90,7 +90,22 @@ class DB:
             response_format: str = 'default',
             **kwargs
     ):
-        data, fields, n = await self.__query(query, params = kwargs, method='value')
+        data, fields, n, time_ms = await self.__query(query, params = kwargs, method='value')
         if response_format == 'json' or self.response_format == 'json':
             data = orjson.loads(data)
-        return data
+        logger.debug(time_ms)
+        return data, time_ms
+
+    async def stream(
+            self,
+            query: str,
+            **kwargs
+    ):
+        pool = await self.pool()
+        rquery, args = render(query, **kwargs)
+        logger.debug(f"Running stream: {rquery}, {args}")
+        async with pool.acquire() as con:
+            stm = await con.prepare(rquery)
+            async for record in stm:
+                logger.debug('here')
+                yield record

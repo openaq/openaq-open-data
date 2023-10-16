@@ -6,3 +6,13 @@ data/*
 /.notes
 lambda/__pycache__/*
 lambda/open_data_export/__pycache__/*
+/venv/
+/lambda/venv/
+*scratch.sql
+data/*
+/lambda/data/
+/lambda/notes.txt
+/lambda/sample.csv
+/cdk/cdk.context.json
+/.build/
+/.env*

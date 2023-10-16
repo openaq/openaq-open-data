@@ -1,8 +1,8 @@
-pydantic[dotenv]
-#asyncpg
+pydantic[dotenv]==1.10
 psycopg[binary]
 buildpg
-pyarrow
+#pyarrow
 pandas
 orjson
-boto3
+#backports
+smart_open[s3]

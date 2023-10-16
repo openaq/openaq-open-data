@@ -17,7 +17,7 @@ setup(
         "psycopg[binary]",
         #"asyncpg",
         "buildpg",
-        "pyarrow",
+        #"pyarrow",
         "pandas",
         "orjson",
         #"boto3"

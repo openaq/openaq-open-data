@@ -1,9 +1,11 @@
 import logging
 import os
 import csv
+import gzip
 
 from open_data_export.pgdb import DB
 from open_data_export.config import settings
+from smart_open import open
 
 # import asyncio
 import time
@@ -11,7 +13,7 @@ import time
 # from pyarrow import csv
 # import pyarrow.parquet as pq
 from pandas import DataFrame
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO, BytesIO
 from typing import Union
 import boto3
@@ -29,6 +31,8 @@ logging.getLogger('botocore').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 s3 = boto3.client("s3")
+cloudwatch = boto3.client("cloudwatch")
+
 db = None
 # Iterate the version number when when a change is made
 # version number must be an integer
@@ -42,6 +46,44 @@ def get_database():
     return db
 
 
+def put_metric(
+        namespace,
+        metricname,
+        value,
+        units: str = None,
+        attributes: dict = None,
+):
+    try:
+        dimensions = [
+            {
+                'Name': 'Environment',
+                'Value': 'openaq',
+            },
+        ]
+        if attributes is not None:
+            for key in attributes.keys():
+                dimensions.append({
+                    'Name': key,
+                    'Value': str(attributes[key]),
+                })
+
+        cloudwatch.put_metric_data(
+            Namespace=namespace,
+            MetricData=[
+                {
+                    'MetricName': metricname,
+                    'Dimensions': dimensions,
+                    'Unit': units,
+                    'Value': value,
+                    'StorageResolution': 1,
+                },
+            ],
+        )
+
+    except Exception as e:
+        logger.warn(f'Could not submit custom metric: {namespace}/{metricname}: {e}')
+
+
 def ping(event, context):
     """
     Test environmental variables and database connection
@@ -49,6 +91,7 @@ def ping(event, context):
     ctime = "failed"
     total = "failed"
     exported = "failed"
+    logger.info('Pinging database')
     db = get_database()
     try:
         ctime = db.value('SELECT now()::text as now')
@@ -60,6 +103,83 @@ def ping(event, context):
         logger.info(f"""
         HOST: {settings.DATABASE_HOST}, EVENT: {event}, LOCATION: {settings.WRITE_FILE_LOCATION} TIME: {ctime} TOTAL: {total}, EXPORTED: {exported}
         """)
+
+
+def dump_measurements(
+        day: Union[str, datetime.date]
+):
+    """
+    Export the 24h (utc) data to the export bucket
+    This file has a different format than the open data format
+    and does not include any metadata other than station id
+    """
+
+    sql = """
+    SELECT sensors_id
+    , datetime
+    , value
+    , lat
+    , lon
+    , added_on
+    FROM measurements
+    WHERE datetime > :day::date
+    AND datetime <= :nextday::date
+    LIMIT 30000000
+    """
+
+    if isinstance(day, str):
+        day = datetime.fromisoformat(day).date()
+
+    bucket = "openaq-db-backups"
+    folder = "testing"
+    ext = "csv.gz"
+    nextday = day + timedelta(days=1)
+    formatted_start = day.strftime("%Y%m%d%H%M%S")
+    formatted_end = nextday.strftime("%Y%m%d%H%M%S")
+    version = "v0"
+    filepath = f"{folder}/measurements_{version}_{formatted_start}_{formatted_end}"
+
+    logger.debug(f"Writing to {bucket}/{filepath}")
+    db = get_database()
+    start = time.time()
+
+    data = db.stream(
+        sql,
+        day=day,
+        nextday=nextday,
+        chunk_size=1000,
+    )
+    n = 0
+
+    params = {"buffer_size": 5*1024 ** 2}
+    with open(f"s3://{bucket}/{filepath}.{ext}", "wb", params) as fout:
+        include_header = True
+        for chunk in data:
+            n += len(chunk)
+            csv = chunk.to_csv(header=include_header)
+            include_header = False
+            fout.write(csv.encode('UTF-8'))
+
+        # out = BytesIO()
+        # row.to_csv(csv_buffer, index=False, mode="w", encoding="UTF-8")
+        # row.to_csv(out, index=False, compression="gzip")
+        # logger.debug(csv_buffer.read())
+
+    logger.info(
+        "dump_measurements (query): day: %s; %s rows; %0.4f seconds",
+        day, n, time.time() - start
+    )
+
+    #download_file(bucket, f"{filepath}.{ext}")
+
+    return filepath
+
+
+def dump_metadata():
+    """
+    Export the public metadata to the export bucket
+    """
+    print('here')
 
 
 def reset_queue():
@@ -251,6 +371,24 @@ def move_objects_handler(event, context=None):
     logger.info(f'Moved {successes} files (of {len(days)}) in {sec} seconds')
 
 
+def update_hourly_data(ts):
+    """
+    Mark the location/day as exported
+    """
+    if isinstance(ts, str):
+        day = datetime.fromisoformat(ts)
+    sql = """
+	SELECT update_hourly_data(:datetime::timestamptz)
+    """
+    db = get_database()
+    n, time_ms = db.value(
+        sql,
+        datetime=ts
+    )
+    logger.info(f"Updated hourly data: {ts} ({n}) in {time_ms} ms")
+    return n, time_ms
+
+
 def update_export_log(
         day: str,
         node: int,
@@ -276,7 +414,7 @@ def update_export_log(
     )
     WHERE day = :day
     AND sensor_nodes_id = :node
-    RETURNING open_data_export_logs_id
+    RETURNING TRUE
     """
     db = get_database()
     return db.rows(
@@ -305,7 +443,7 @@ def submit_error(day: str, node: int, error: str):
     , 'at', current_timestamp::text
     ))::json
     WHERE day = :day AND sensor_nodes_id = :node
-    RETURNING open_data_export_logs_id
+    RETURNING TRUE
     """
     logger.error(f"error: {node} on {day} - {error}")
     db = get_database()
@@ -338,6 +476,7 @@ def get_pending_location_days():
     """
     get the set of location/days that need to be updated
     """
+    logger.debug(f'get_pending_days: {settings.LIMIT}')
     sql = f"""
     SELECT * FROM get_pending({settings.LIMIT})
     """
@@ -356,7 +495,7 @@ def get_outdated_location_days():
     return db.rows(sql)
 
 
-def get_measurement_data_b(
+def get_measurement_data_n(
         sensor_nodes_id: int,
         day: Union[str, datetime.date],
 ):
@@ -370,60 +509,68 @@ def get_measurement_data_b(
     if isinstance(day, str):
         day = datetime.fromisoformat(day).date()
 
-    # where = {
-    #     'day1': day,
-    #     'day2': day,
-    #     'sensor_nodes_id': f"{sensor_nodes_id}",
-    # }
-
     # Start by getting the sensor node data
     db = get_database()
-    sn = db.rows(f"""
-    SELECT array_agg(sensors_id)
-    FROM sensors s
-    JOIN sensor_systems sy ON (s.sensor_systems_id = sy.sensor_systems_id)
-    JOIN sensor_nodes sn ON (sy.sensor_nodes_id = sn.sensor_nodes_id)
-    WHERE sn.sensor_nodes_id = {sensor_nodes_id}
-    """)
 
-    #sn = [[[899869, 899870, 899871, 417082, 417083, 417084]]]
-    #sn = [[[899869]]]
-    logger.info(sn[0][0][0])
-    # AND (m.datetime - '1sec'::interval)::date = :day
-    # , p.measurand||'-'||ss.sensor_systems_id||'-'||p.units as measurand
-    # sql = """
-    # SELECT *
-    # FROM measurements
-    # WHERE sensors_id = ANY(:sensors_id)
-    # AND datetime > timezone(tz, (:day1)::timestamp)
-    # AND datetime <= timezone(tz, :day2 + '1day'::interval)
-    # """
-
-    #
-
-    sql = """
-    SELECT *
-    FROM measurements m
-    JOIN (VALUES (889248), (899870), (889250), (415649), (415648), (415650)) as t(sensors_id) ON (m.sensors_id = t.sensors_id)
-    WHERE  TRUE -- sensors_id = :sensors_id
-    AND datetime > (:day1)::timestamp
-    AND datetime <= :day2 + '1day'::interval
+    sql = f"""
+    WITH sensors AS (
+      SELECT sensors_id
+      , s.source_id as sensor
+      , sn.site_name||'-'||sy.sensor_systems_id as location
+      , s.measurands_id
+      , p.measurand
+      , p.units
+      , sn.sensor_nodes_id
+      , st_x(geom) as lon
+      , st_y(geom) as lat
+      , pr.export_prefix as provider
+      , sn.ismobile
+      , CASE WHEN sn.ismobile
+        THEN 'mobile'
+        ELSE COALESCE(LOWER(sn.country), 'no-country')
+        END as country
+		  , z.tzid as tz
+      FROM sensors s
+      JOIN measurands p ON (s.measurands_id = p.measurands_id)
+      JOIN sensor_systems sy ON (s.sensor_systems_id = sy.sensor_systems_id)
+      JOIN sensor_nodes sn ON (sy.sensor_nodes_id = sn.sensor_nodes_id)
+      JOIN providers pr ON (sn.source_name = pr.source_name)
+	    JOIN timezones z ON (sn.timezones_id = z.gid)
+      WHERE sn.sensor_nodes_id = :sensor_nodes_id)
+    SELECT s.sensor_nodes_id as location_id
+    , s.location
+    , s.sensors_id
+    , s.measurands_id
+    , format_timestamp(m.datetime, tz) as datetime
+    , s.measurand as parameter
+    , s.units
+    , m.value
+    , s.provider
+    , s.country
+    , CASE WHEN s.ismobile
+      THEN m.lon
+      ELSE s.lon
+      END as lon
+    , CASE WHEN s.ismobile
+      THEN m.lat
+      ELSE s.lat
+      END as lat
+      FROM public.measurements m
+    JOIN sensors s ON (m.sensors_id = s.sensors_id)
+    AND datetime > timezone(tz, (:day1)::timestamp)
+    AND datetime <= timezone(tz, :day2 + '1day'::interval)
     """
 
     logger.debug(
         f'Getting measurement data for {sensor_nodes_id} for {day}'
     )
 
-    rows = db.rows(
+    rows, time_ms = db.rows(
         sql,
         day1=day,
         day2=day,
-        sensors_id=sn[0][0][0],
+        sensor_nodes_id=sensor_nodes_id,
         response_format='DataFrame'
-    )
-
-    raise Exception(
-        f"TESTING EXPORT METHODS"
     )
 
     return rows
@@ -474,7 +621,14 @@ def get_measurement_data(
     logger.debug(
         f'Getting measurement data for {sensor_nodes_id} for {day}'
     )
-    rows = db.rows(sql, **where, response_format='DataFrame')
+    rows, time_ms = db.rows(sql, **where, response_format='DataFrame')
+    logger.info(
+        "get_measurement_data: node: %s, day: %s, seconds: %0.4f, results: %s",
+        sensor_nodes_id,
+        day,
+		time_ms,
+        len(rows)
+    )
     return rows
 
 
@@ -488,51 +642,52 @@ def reshape(rows: Union[DataFrame, dict], fields: list = []):
     return rows
 
 
-def write_file(tbl, filepath: str = 'example'):
+def write_file(
+        tbl,
+        filepath: str = 'example',
+        bucket: str = settings.OPEN_DATA_BUCKET,
+        ext: str = settings.WRITE_FILE_FORMAT,
+        location: str = settings.WRITE_FILE_LOCATION,
+        public: bool = True
+):
     """
     write the results in the given format
     """
-    if settings.WRITE_FILE_FORMAT == 'csv':
-        logger.debug('writing file to csv format')
+    if ext == 'csv':
         out = StringIO()
-        ext = 'csv'
         mode = 'w'
         tbl.to_csv(out, index=False, quoting=csv.QUOTE_NONNUMERIC)
-    elif settings.WRITE_FILE_FORMAT == 'csv.gz':
-        logger.debug('writing file to csv.gz format')
+    elif ext == 'csv.gz':
         out = BytesIO()
-        ext = 'csv.gz'
         mode = 'wb'
         tbl.to_csv(out, index=False, compression="gzip")
-    elif settings.WRITE_FILE_FORMAT == 'parquet':
-        logger.debug('writing file to parquet format')
+    elif ext == 'parquet':
         out = BytesIO()
-        ext = 'parquet'
         mode = 'wb'
         tbl.to_parquet(out, index=False)
-    elif settings.WRITE_FILE_FORMAT == 'json':
+    elif ext == 'json':
         raise Exception("We are not supporting JSON yet")
     else:
-        raise Exception(f"We are not supporting {settings.WRITE_FILE_FORMAT}")
+        raise Exception(f"We are not supporting {ext}")
 
     if (
-        settings.WRITE_FILE_LOCATION == 's3'
-        and settings.OPEN_DATA_BUCKET is not None
-        and settings.OPEN_DATA_BUCKET != ''
+        location == 's3'
+        and bucket is not None
+        and bucket != ''
     ):
         logger.debug(
-            f"write_file: {settings.OPEN_DATA_BUCKET}/{filepath}.{ext}"
+            f"writing file to: {bucket}/{filepath}.{ext}"
         )
         s3.put_object(
-            Bucket=settings.OPEN_DATA_BUCKET,
+            Bucket=bucket,
             Key=f"{filepath}.{ext}",
-            ACL='public-read',
+            ACL='public-read' if public else 'private',
             Body=out.getvalue()
-         )
-    elif settings.WRITE_FILE_LOCATION == 'local':
+        )
+    elif location == 'local':
         filepath = os.path.join(settings.LOCAL_SAVE_DIRECTORY, filepath)
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        logger.debug(f"writing file to local file in {filepath}")
+        logger.debug(f"writing file to local file in {filepath}.{ext}")
         txt = open(f"{filepath}.{ext}", mode)
         txt.write(out.getvalue())
         txt.close()
@@ -543,16 +698,19 @@ def write_file(tbl, filepath: str = 'example'):
 
 
 def export_data(day, node):
-    start = time.time()
     yr = day.strftime('%Y')
     mn = day.strftime('%m')
     dy = day.strftime('%d')
 
     try:
-        rows = get_measurement_data(
+        start = time.time()
+		# using the statement version and not the view
+        rows = get_measurement_data_n(
             sensor_nodes_id=node,
             day=day,
         )
+
+        get_ms = time.time() - start
 
         if len(rows) > 0:
             country = rows['country'][0]
@@ -572,48 +730,45 @@ def export_data(day, node):
                 ]
             )
             bucket = settings.OPEN_DATA_BUCKET
-            filepath = f"""records/{settings.WRITE_FILE_FORMAT}/provider={provider}/country={country}/locationid={node}/year={yr}/month={mn}/location-{node}-{yr}{mn}{dy}"""
+            filepath = f"records/{settings.WRITE_FILE_FORMAT}/locationid={node}/year={yr}/month={mn}/location-{node}-{yr}{mn}{dy}"
             write_file(df, filepath)
         else:
             filepath = None
             bucket = None
 
         sec = time.time() - start
-        update_export_log(day, node, len(rows), sec, bucket, filepath)
+        start = time.time()
+        res, update_ms = update_export_log(day, node, len(rows), sec, bucket, filepath)
+
         logger.info(
-            "export_data: location: %s, day: %s; %s rows; %0.4f seconds",
-            node, f"{yr}-{mn}-{dy}", len(rows), sec
+            "export_data: location: %s, day: %s; %s rows; %0.2fs, %0.2fs, %0.2fs",
+            node, f"{yr}-{mn}-{dy}", len(rows), get_ms, sec, update_ms
         )
+        return len(rows), round(sec*1000)
     except Exception as e:
         submit_error(day, node, str(e))
 
 
-def export_pending(event={}, context={}):
+def export_pending():
     """
     Only export the location/days that are marked for export. Location days
     will be limited to the value in the LIMIT environmental parameter
     """
-    if 'source' not in event.keys():
-        event['source'] = 'not set'
-
-    if 'method' in event.keys():
-        if event['method'] == 'ping':
-            return ping(event, context)
-
     start = time.time()
-    days = get_pending_location_days()
+    days, time_ms = get_pending_location_days()
     for d in days:
         try:
-            export_data(d[1], d[0])
+            logger.debug(f"{d[1]}/{d[0]}")
+            export_data(day=d[1], node=d[0])
         except Exception as e:
             logger.warning(f"Error processing {d[0]}-{d[1]}: {e}")
 
     logger.info(
-        "export_pending: %s; seconds: %0.4f; source: %s",
+        "export_pending: %s; seconds: %0.4f;",
         len(days),
         time.time() - start,
-        event['source'],
     )
+
     return len(days)
 
 
@@ -625,20 +780,26 @@ def update_outdated_handler(event=None, context=None):
     if context is not None:
         time_available = context.get_remaining_time_in_millis()/1000
     else:
-        time_available = 120
+        time_available = 80  # basically do it once
 
     time_left = time_available
     days = 0
     start = time.time()
+    last_days = settings.LIMIT
 
-    while time_spent <= time_left:
+    # Keep updating until we are out of time or days
+    while (
+            time_spent <= time_left
+            and last_days == settings.LIMIT
+           ):
         logger.info(
             "update_outdated_handler: time spent: %0.2f, time left: %0.2f",
             time_spent,
             time_left,
         )
         method_start = time.time()
-        days += update_outdated(event, context)
+        last_days = update_outdated(event, context)
+        days += last_days
         time_spent = time.time() - method_start
         time_left = time_available - (time.time() - start)
 
@@ -666,7 +827,7 @@ def update_outdated(event={}, context={}):
     days = get_outdated_location_days()
     logger.info(
         "get_outdated: %s rows; seconds: %0.4f; source: %s",
-        settings.LIMIT,
+        len(days),
         time.time() - start,
         event['source'],
     )
@@ -696,11 +857,51 @@ def export_all():
     return export_pending()
 
 
-if __name__ == '__main__':
-    # rsp = asyncio.run(export_all())
-    # rsp = asyncio.run(reset_queue())
-    # rsp = asyncio.run(get_pending_location_days())
-    # rsp = asyncio.run(export_pending())
-    # rsp = asyncio.run(update_export_log('2021-08-08', 1))
-    # print(rsp)
-    print(f"total query time: {db.query_time}")
+def download_file(bucket: str, key: str):
+    obj = s3.get_object(
+        Bucket=bucket,
+        Key=key
+    )
+    body = obj['Body']
+    if key.endswith(".gzd"):
+        text = gzip.decompress(body.read()).decode('utf-8')
+    else:
+        text = body
+
+    fpath = os.path.expanduser(f'~/Downloads/{bucket}/{key}')
+    fpath = fpath.replace('.gzd', '')
+    os.makedirs(os.path.dirname(fpath), exist_ok=True)
+    with open(fpath, 'w') as f:
+        f.write(text)
+    return obj
+
+
+def handler(event={}, context={}):
+    """
+    Only export the location/days that are marked for export. Location days
+    will be limited to the value in the LIMIT environmental parameter
+    """
+    if 'source' not in event.keys():
+        event['source'] = 'not set'
+
+    if 'method' in event.keys():
+        if event['method'] == 'ping':
+            return ping(event, context)
+        elif event['method'] == 'dump':
+            return dump_measurements(**event['args'])
+    else:
+        return export_pending()
+
+
+def test():
+    days = [
+        ['2022-08-10', 233590],
+        ['2022-08-10', 233591],
+        ['2022-08-10', 233592],
+        ['2021-02-08', 66470],
+    ]
+    if (len(days) > 0):
+        for d in days:
+            day = d[0]
+            node = d[1]
+            get_measurement_data(node, day)

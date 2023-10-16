@@ -7,7 +7,7 @@ The exporter works by monitoring a table that keeps track of the last time a loc
 
 2. An AWS Lambda function is run at a given rate (e.g. 5min, 1hour) to export any pending location/days. The method uses the `get_pending(limit)` function to pull down any pending updates and mark them as queued. Marking them ensures that another process does not come along and pull them down as well. This process also only pulls down location/days with a complete day of data based on their timezone. This spreads out the export process and reduces the number of times a file is touched.
 
-3. Once the file is exported its export date is updated in the export log. If new data is added to this file at anytime the process will update the `modiifed_on` date and mark the file for export.
+3. Once the file is exported its export date is updated in the export log. If new data is added to this file at anytime the process will update the `modified_on` date and mark the file for export.
 
 # Tuning
 Lambda functions are not meant to run for very long and will timeout after a set amount of time, with the max runtime being 15 min. If the lambda function times out before getting to all of the queued location/dates those location/dates will be marked as queued but never exported and need to be reset [^improvements]. Given this you want to make sure that the lambda does not pull down more than it can handle in a given period. To do this there are a few parameters you can adjust.
@@ -38,8 +38,14 @@ DATABASE_HOST=172.17.0.2
 DATABASE_PORT=5432
 DATABASE_DB=postgres
 ```
+# Process
 
-# Installing
+
+# Testing
+virtualenv venv
+source venv/bin/activate
+
+# Deploying
 You will need to install a few different parts to get this working.
 1. Update your database to include the export module (see `tables/exports.sql` and `idempotent/exports_views.sql` in the `openaq-db` repository). There is a [patch](schema/schema.sql) file to help with this but you may need to adjust the paths.
 2. Update the `openaq-api-v2` ingest process to include the new `lcs_meas_ingest.sql` file.
