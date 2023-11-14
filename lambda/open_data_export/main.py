@@ -5,6 +5,7 @@ import gzip
 import re
 
 from multiprocessing import Process, Pool
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from open_data_export.pgdb import DB
 from open_data_export.config import settings
 from smart_open import open
@@ -18,7 +19,9 @@ from pandas import DataFrame
 from datetime import datetime, timedelta
 from io import StringIO, BytesIO
 from typing import Union
+import botocore
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger('main')
 
@@ -32,7 +35,11 @@ logging.getLogger('boto3').setLevel(logging.WARNING)
 logging.getLogger('botocore').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
-s3 = boto3.client("s3")
+max_processes =  os.cpu_count() + 4
+boto_config = botocore.config.Config(
+    max_pool_connections=max_processes,
+)
+s3 = boto3.client("s3", config=boto_config)
 cloudwatch = boto3.client("cloudwatch")
 
 db = None
@@ -195,20 +202,22 @@ def reset_queue():
     return db.rows(sql, response_format='DataFrame')
 
 
-def object_exists(Bucket: str, Key: str):
+def object_info(Bucket: str, Key: str):
     """Check to see if a given key exists in a bucket"""
-    exists = False
-    try:
-        s3.head_object(Bucket=Bucket, Key=Key)
-        exists = True
-    except Exception:
-        pass
-    logger.debug(f'{exists} - {Bucket}/{Key}')
-    return exists
+    return s3.head_object(Bucket=Bucket, Key=Key)
+
+def object_is_public_read(Bucket: str, Key: str):
+    """Check to see a given object is public read"""
+    acl = s3.get_object_acl(Bucket=Bucket, Key=Key)
+    for grant in acl.get('Grants', []):
+        grantee = grant.get('Grantee')
+        if grantee.get('URI') == 'http://acs.amazonaws.com/groups/global/AllUsers':
+            logger.debug(f"is_public_read: {grant}")
+            return grant.get('Permission') == 'READ'
+    return False
 
 
 def copy_object(from_location, to_location, delete=False):
-    logger.debug(f"moving {from_location['Bucket']}/{from_location['Key']}\n to {to_location['Bucket']}/{to_location['Key']}")
     try:
         if (to_location['Bucket'] != from_location['Bucket'] or to_location['Key'] != from_location['Key']):
             s3.copy_object(
@@ -229,16 +238,16 @@ def copy_object(from_location, to_location, delete=False):
                 logger.debug(f"Deleted: {from_location['Bucket']}/{from_location['Key']}")
         else:
             # if its the same lets just update the ACL policy
-            s3.put_object_acl(
+            res = s3.put_object_acl(
                 Bucket=to_location['Bucket'],
                 Key=to_location['Key'],
                 ACL='public-read',
             )
-
+            logger.warn(f'fixing acl - {res}')
         return True
 
     except s3.exceptions.NoSuchKey:
-        new_exists = object_exists(
+        new_exists = object_info(
             Bucket=to_location['Bucket'],
             Key=to_location['Key'],
         )
@@ -262,6 +271,16 @@ def move_objects_handler(event, context=None):
     # AND (l.metadata->>'move' IS NOT NULL AND (l.metadata->>'move')::boolean = true)
     args = {}
 
+    where = """
+            l.key IS NOT NULL
+            AND l.key ~* :pattern
+            AND l.exported_on IS NOT NULL
+            AND l.records > :records
+            AND l.metadata->>'error' IS NULL
+            """
+
+    args = { "records": 0, "pattern": "/country" }
+
     if 'limit' in event.keys() and event['limit'] is not None:
         limit = event['limit']
 
@@ -273,14 +292,6 @@ def move_objects_handler(event, context=None):
         args['node'] = event['node']
         where += " AND l.sensor_nodes_id = :node"
 
-    where = """
-			COALESCE(key, l.metadata->>'Key') IS NOT NULL
-			AND COALESCE(key, l.metadata->>'Key') ~* :pattern
-			AND l.exported_on IS NOT NULL
-			AND l.records > :records
-			"""
-
-    args = { "records": 0, "pattern": "/provider" }
 
     # determine the extension type
     if settings.WRITE_FILE_FORMAT == 'csv':
@@ -305,9 +316,8 @@ def move_objects_handler(event, context=None):
          SELECT
           l.day
         , l.sensor_nodes_id
-        , COALESCE(l.key, l.metadata->>'Key') as from_key
-        , FORMAT('records/csv.gz/country=%%s/locationid=%%s/year=%%s/month=%%s/location-%%s-%%s.{ext}'
-          , lower(COALESCE(c.iso, 'no-country'))
+        , l.key as from_key
+        , FORMAT('records/csv.gz/locationid=%%s/year=%%s/month=%%s/location-%%s-%%s.{ext}'
           , l.sensor_nodes_id
           , to_char(l.day, 'YYYY')
           , to_char(l.day, 'MM')
@@ -316,7 +326,6 @@ def move_objects_handler(event, context=None):
         ) as to_key
         FROM open_data_export_logs l
         JOIN sensor_nodes sn ON (l.sensor_nodes_id = sn.sensor_nodes_id)
-        JOIN countries c ON (sn.countries_id = c.countries_id)
         WHERE {where}
         LIMIT {limit})
         -----------
@@ -328,6 +337,7 @@ def move_objects_handler(event, context=None):
            'moved_on', now(),
            'moved_from', from_key
         )
+         , checked_on = now()
         FROM days
         WHERE days.sensor_nodes_id=open_data_export_logs.sensor_nodes_id
         AND days.day=open_data_export_logs.day
@@ -337,41 +347,151 @@ def move_objects_handler(event, context=None):
         RETURNING days.*;
         """, **args)
 
-    successes = 0
-    regex = re.compile('s3://[a-z-]+/', re.IGNORECASE)
-    for row in days:
-        logger.debug(row)
-        day = row[0]
-        node = row[1]
-        from_key = row[2]
-        to_key = row[3]
+    with ThreadPoolExecutor(max_workers=max_processes) as exe:
+        jobs = []
+        for row in days:
+            jobs.append(exe.submit(move_objects_mp, row))
 
-        yr = day.strftime('%Y')
-        mn = day.strftime('%m')
-        dy = day.strftime('%d')
-
-        try:
-            # make sure that we have the extension on the from_key
-            if not from_key.endswith(ext):
-                from_key = f"{from_key}.{ext}"
-
-            copy_object(
-                from_location={
-                    "Bucket": settings.OPEN_DATA_BUCKET,
-                    "Key": regex.sub('', from_key),
-                },
-                to_location={
-                    "Bucket": settings.OPEN_DATA_BUCKET,
-                    "Key": to_key,
-                },
-				delete=False
-            )
-            successes += 1
-        except Exception as e:
-            submit_move_error(day, node, from_key, f"{e}")
+        count = 0
+        for job in as_completed(jobs):
+            count += job.result()
 
     sec = time.time() - start
-    logger.info(f'Moved {successes} files (of {len(days)}) in {sec} seconds (query: {time_ms/1000})')
+    logger.info(f'Moved {count} files (of {len(days)}) in {sec} seconds (query: {time_ms/1000}, processes: {max_processes})')
+
+def move_objects_mp(row):
+    day = row[0]
+    node = row[1]
+    from_key = row[2]
+    to_key = row[3]
+    ext = settings.WRITE_FILE_FORMAT
+
+    try:
+        # make sure that we have the extension on the from_key
+        if not from_key.endswith(ext):
+            from_key = f"{from_key}.{ext}"
+
+        pattern = 's3://([a-z-]+)/'
+        if match := re.search(pattern, from_key, re.IGNORECASE):
+            bucket = match.group(1)
+            from_key = re.sub(pattern, '', from_key)
+        else:
+            bucket = settings.OPEN_DATA_BUCKET
+
+        copy_object(
+            from_location={
+                "Bucket": bucket,
+                "Key": from_key,
+                    },
+            to_location={
+                "Bucket": settings.OPEN_DATA_BUCKET,
+                "Key": to_key,
+                    },
+            delete=False
+            )
+        return 1
+    except Exception as e:
+        submit_move_error(day, node, from_key, f"{e}")
+        return 0
+
+def check_objects(day=None,node=None,limit=10):
+    start = time.time()
+    db = get_database()
+    args ={}
+    ext = settings.WRITE_FILE_FORMAT
+
+    where = ""
+
+    if day is not None:
+        args['day'] = datetime.fromisoformat(day).date()
+        where += " AND l.day = :day"
+
+    if node is not None:
+        args['node'] = node
+        where += " AND l.sensor_nodes_id = :node"
+    else:
+        where += """
+                 AND (has_error IS NULL OR NOT has_error)
+                 AND (checked_on IS NULL OR checked_on  < current_date - 1)
+                 """
+
+    if limit >= 0:
+        where += " LIMIT :limit"
+        args['limit'] = limit
+
+    sql = f"""
+          WITH keys AS (
+            SELECT day
+            , sensor_nodes_id
+            , key
+            FROM open_data_export_logs l
+            WHERE l.exported_on IS NOT NULL
+            AND l.records > 0
+            AND l.key IS NOT NULL
+            {where})
+          UPDATE open_data_export_logs
+          SET checked_on = now()
+           , has_error = false
+          FROM keys
+          WHERE keys.sensor_nodes_id=open_data_export_logs.sensor_nodes_id
+          AND keys.day=open_data_export_logs.day
+          -----------
+          -- return the pre-update data
+          -----------
+          RETURNING keys.*;
+          """
+
+    keys, time_ms = db.rows(sql, **args)
+
+    with ThreadPoolExecutor(max_workers=max_processes) as exe:
+        jobs = []
+        for row in keys:
+            jobs.append(exe.submit(check_objects_mp, row))
+
+        count = 0
+        for job in as_completed(jobs):
+            count += job.result()
+
+    sec = time.time() - start
+    logger.info(f'Checked {count} objects (of {len(keys)}) in {sec} seconds (query: {time_ms/1000}, processes: {max_processes})')
+
+def check_objects_mp(row):
+    day = row[0]
+    node = row[1]
+    key = row[2]
+    ext = settings.WRITE_FILE_FORMAT
+
+    try:
+        # make sure that we have the extension on the from_key
+        if key is None:
+            logger.warning('Missing key')
+            return 0
+
+        if not key.endswith(ext):
+            key = f"{key}.{ext}"
+
+        pattern = 's3://([a-z-]+)/'
+        if match := re.search(pattern, key, re.IGNORECASE):
+            bucket = match.group(1)
+            key = re.sub(pattern, '', key)
+        else:
+            bucket = settings.OPEN_DATA_BUCKET
+
+        # temporary until we can figure out the acl perimissions issue
+        #info = object_info(Bucket=bucket, Key=key)
+        #info = copy_object(from_location={"Bucket":bucket, "Key":key}, to_location={"Bucket":bucket, "Key":key})
+        #return 1
+
+        is_public_read = object_is_public_read(Bucket=bucket, Key=key)
+        if not is_public_read:
+            ## assume it exists but is not public
+            logger.warn(f'Updating object acl - {key}')
+            s3.put_object_acl(Bucket=bucket, Key=key, ACL='public-read')
+
+        return 1
+    except Exception as err:
+        submit_error(day, node, err)
+        return 0
 
 
 def update_hourly_data(ts):
@@ -409,14 +529,13 @@ def update_export_log(
     UPDATE public.open_data_export_logs
     SET exported_on = now()
     , records = :n
+    , key = :key
+    , has_error = :error
     , metadata = jsonb_build_object(
-      'Bucket', (:bucket)::text
-    , 'Key', (:key)::text
-    , 'sec', (:sec)::numeric
+      'sec', (:sec)::numeric
     , 'version', :version
     )
-    WHERE day = :day
-    AND sensor_nodes_id = :node
+    WHERE day = :day AND sensor_nodes_id = :node
     RETURNING TRUE
     """
     db = get_database()
@@ -426,18 +545,29 @@ def update_export_log(
         node=node,
         n=n,
         sec=sec,
-        bucket=bucket,
-        key=key,
+		error=False,
+        key=f"s3://{bucket}/{key}",
         version=FILE_FORMAT_VERSION
     )
 
 
-def submit_error(day: str, node: int, error: str):
+def submit_error(day: str, node: int, error):
     """
     Mark the location/day with an error message
     """
+
+    if isinstance(error, ClientError):
+        logger.info(error)
+        error = error.response['Error']['Code']
+		# head_object returns different code than get_object_acl
+        if error == '404':
+            error = 'NoSuchKey'
+    else:
+        error = f"{error}"
+
     if isinstance(day, str):
         day = datetime.fromisoformat(day).date()
+
     sql = """
     UPDATE open_data_export_logs
     SET metadata = (COALESCE(metadata::jsonb, '{}'::jsonb)||jsonb_build_object(
@@ -445,6 +575,7 @@ def submit_error(day: str, node: int, error: str):
     , 'message', (:error)::text
     , 'at', current_timestamp::text
     ))::json
+		  , has_error = true
     WHERE day = :day AND sensor_nodes_id = :node
     RETURNING TRUE
     """
@@ -722,6 +853,10 @@ def write_file(
 
 
 def export_data(day, node):
+
+    if isinstance(day, str):
+        day = datetime.fromisoformat(day).date()
+
     yr = day.strftime('%Y')
     mn = day.strftime('%m')
     dy = day.strftime('%d')
@@ -762,7 +897,7 @@ def export_data(day, node):
 
         sec = time.time() - start
         start = time.time()
-        res, update_ms = update_export_log(day, node, len(rows), sec, bucket, filepath)
+        res, update_ms = update_export_log(day, node, len(rows), sec, bucket, f"{filepath}.{settings.WRITE_FILE_FORMAT}")
 
         logger.info(
             "export_data: location: %s, day: %s; %s rows; %0.2fs, %0.2fs, %0.2fs",
@@ -918,6 +1053,12 @@ def handler(event={}, context={}):
             return ping(event, context)
         elif event['method'] == 'dump':
             return dump_measurements(**event['args'])
+        elif event['method'] == 'move':
+            return move_objects_handler(event.get('args'))
+        elif event['method'] == 'check':
+            return check_objects(**event.get('args'))
+        elif event['method'] == 'export':
+            return export_data(**event.get('args'))
     else:
         return export_pending()
 

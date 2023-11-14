@@ -37,7 +37,6 @@ class ExportStack(Stack):
         """Define stack."""
         super().__init__(scope, id, **kwargs)
 
-        print(vpc_id)
         if vpc_id not in [None, 'null']:
             vpc = _ec2.Vpc.from_lookup(
                 self,
@@ -119,7 +118,6 @@ class ExportStack(Stack):
             )
             db_backup_bucket.grant_put(exportPendingLambda)
             db_backup_bucket.grant_put_acl(exportPendingLambda)
-
 
 
 
@@ -206,44 +204,96 @@ class MoveStack(Stack):
         scope: Construct,
         id: str,
         package_directory: str,
+        env_name: str,
+        ingest_lambda_timeout: int,
+        ingest_lambda_memory_size: int,
         env_variables: dict = {},
+        lambda_role_arn: str = None,
+        vpc_id: str | None = None,
         **kwargs,
     ) -> None:
         """Define stack."""
         super().__init__(scope, id, **kwargs)
 
-        package = _lambda.Code.from_asset(
-            str(pathlib.Path.joinpath(package_directory, "package.zip"))
-        )
+        if vpc_id not in [None, 'null']:
+            vpc = _ec2.Vpc.from_lookup(
+                self,
+                f"{id}-exporter-vpc",
+                vpc_id=vpc_id,
+            )
+        else:
+            vpc = None
+
+        lambda_role = None
+        if lambda_role_arn is not None:
+            lambda_role = _iam.Role.from_role_arn(
+                self,
+                f"{id}-role",
+                role_arn=lambda_role_arn
+            )
 
         moveLambda = _lambda.Function(
             self,
             f"{id}-move-objects-lambda",
             runtime=_lambda.Runtime.PYTHON_3_9,
-            code=package,
-            handler='open_data_export.main.move_objects_handler',
-            environment=env_variables,
-            memory_size=512,
-            log_retention=_logs.RetentionDays.ONE_WEEK,
-            timeout=Duration.seconds(900),
-        )
-
-        _events.Rule(
-            self,
-            f"{id}-move-objects-rule",
-            schedule=_events.Schedule.cron(minute="0/1"),
-            targets=[
-                _targets.LambdaFunction(moveLambda),
+            code=_lambda.Code.from_asset(
+                path='../lambda',
+                exclude=[
+                    'venv',
+                    '__pycache__',
+                    '.pytest_cache',
+                    '.hypothesis',
+                    'tests',
+                    '.build',
+                    'cdk',
+                    '*.pyc',
+                    '*.md',
+                    '.env*',
+                    '.gitignore',
+                    'logs',
+                    'move_files.py',
+                    'move_country_files.py',
+                ],
+            ),
+            vpc=vpc,
+            handler='open_data_export.main.handler',
+			role=lambda_role,
+            environment=stringify_settings(env_variables),
+            memory_size=ingest_lambda_memory_size,
+            timeout=Duration.seconds(ingest_lambda_timeout),
+            layers=[
+                create_dependencies_layer(
+                    self,
+                    f"{env_name}",
+                    'move'
+                ),
             ],
+            log_retention=_logs.RetentionDays.ONE_WEEK,
         )
-
+        # _events.Rule(
+        #     self,
+        #     f"{id}-move-objects-rule",
+        #     schedule=_events.Schedule.cron(minute="0/1"),
+        #     targets=[
+        #         _targets.LambdaFunction(moveLambda),
+        #     ],
+        # )
         bucket = _s3.Bucket.from_bucket_name(
             self,
             "{id}-openaq-open-data-exports",
             env_variables['OPEN_DATA_BUCKET'],
         )
-
         # print(rule)
         bucket.grant_put(moveLambda)
         bucket.grant_delete(moveLambda)
         bucket.grant_put_acl(moveLambda)
+
+        moveLambda.add_to_role_policy(
+            _iam.PolicyStatement(
+                actions=["s3:GetObjectAcl"],
+				effect=_iam.Effect.ALLOW,
+                resources=[
+					f"{bucket.bucket_arn}/*"
+		]
+		)
+		)
