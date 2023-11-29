@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     WRITE_FILE_LOCATION: str = 's3'  # local
     WRITE_FILE_FORMAT: str = 'csv'  # parquet, json
     OPEN_DATA_BUCKET: str = 'openaq-open-data-testing'
+    LAMBDA_FUNCTION_ARN: str = None
     DB_BACKUP_BUCKET: str = 'openaq-db-backups'
     DATABASE_READ_USER: str = 'postgres'
     DATABASE_READ_PASSWORD: str = 'postgres'

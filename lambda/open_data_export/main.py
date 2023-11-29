@@ -627,16 +627,16 @@ def get_all_location_days():
     return db.rows(sql, {})
 
 
-def get_pending_location_days():
+def get_pending_location_days(limit=settings.LIMIT):
     """
     get the set of location/days that need to be updated
     """
-    logger.debug(f'get_pending_days: {settings.LIMIT}')
+    logger.debug(f'get_pending_days: {limit}')
     sql = f"""
-    SELECT * FROM get_pending({settings.LIMIT})
+    SELECT * FROM get_pending(:limit)
     """
     db = get_database()
-    return db.rows(sql)
+    return db.rows(sql, limit=limit)
 
 
 def get_outdated_location_days():
@@ -728,7 +728,7 @@ def get_measurement_data_n(
         response_format='DataFrame'
     )
 
-    return rows
+    return rows, time_ms
 
 
 def get_measurement_data(
@@ -808,14 +808,16 @@ def write_file(
     """
     write the results in the given format
     """
+    start = time.time()
+
     if ext == 'csv':
         out = StringIO()
         mode = 'w'
-        tbl.to_csv(out, index=False, quoting=csv.QUOTE_NONNUMERIC)
+        tbl.to_csv(out, index=False, quoting=csv.QUOTE_NONNUMERIC, lineterminator="\r\n")
     elif ext == 'csv.gz':
         out = BytesIO()
         mode = 'wb'
-        tbl.to_csv(out, index=False, compression="gzip")
+        tbl.to_csv(out, index=False, compression="gzip", quoting=csv.QUOTE_NONNUMERIC, lineterminator="\r\n")
     elif ext == 'parquet':
         out = BytesIO()
         mode = 'wb'
@@ -833,9 +835,10 @@ def write_file(
         logger.debug(
             f"writing file to: {bucket}/{filepath}.{ext}"
         )
+        filepath = f"{filepath}.{ext}"
         s3.put_object(
             Bucket=bucket,
-            Key=f"{filepath}.{ext}",
+            Key=filepath,
             ACL='public-read' if public else 'private',
             Body=out.getvalue()
         )
@@ -851,6 +854,9 @@ def write_file(
             f"{settings.WRITE_FILE_LOCATION} is not a valid location"
         )
 
+    ms = time.time() - start
+    return filepath, round(ms*1000)
+
 
 def export_data(day, node):
 
@@ -862,14 +868,11 @@ def export_data(day, node):
     dy = day.strftime('%d')
 
     try:
-        start = time.time()
 		# using the statement version and not the view
-        rows = get_measurement_data_n(
+        rows, get_ms = get_measurement_data_n(
             sensor_nodes_id=node,
             day=day,
         )
-
-        get_ms = time.time() - start
 
         if len(rows) > 0:
             country = rows['country'][0]
@@ -890,50 +893,67 @@ def export_data(day, node):
             )
             bucket = settings.OPEN_DATA_BUCKET
             filepath = f"records/{settings.WRITE_FILE_FORMAT}/locationid={node}/year={yr}/month={mn}/location-{node}-{yr}{mn}{dy}"
-            write_file(df, filepath)
+            fpath, write_ms = write_file(df, filepath)
         else:
-            filepath = None
+            fpath = None
             bucket = None
+            write_ms = 0
 
-        sec = time.time() - start
-        start = time.time()
-        res, update_ms = update_export_log(day, node, len(rows), sec, bucket, f"{filepath}.{settings.WRITE_FILE_FORMAT}")
+        logger.info(fpath)
+        res, update_ms = update_export_log(day, node, len(rows), round((get_ms + write_ms)/1000), bucket, f"{filepath}.{settings.WRITE_FILE_FORMAT}")
 
-        logger.info(
-            "export_data: location: %s, day: %s; %s rows; %0.2fs, %0.2fs, %0.2fs",
-            node, f"{yr}-{mn}-{dy}", len(rows), get_ms, sec, update_ms
+        logger.debug(
+            "export_data: location: %s, day: %s; %s rows; get: %s, write: %s, log: %s",
+            node, f"{yr}-{mn}-{dy}", len(rows), get_ms, write_ms, update_ms
         )
-        return len(rows), round(sec*1000)
+        return len(rows), get_ms, write_ms, update_ms
     except Exception as e:
         submit_error(day, node, str(e))
 
 def export_data_mp(p):
-    logger.info(f"Starting {p[0]}/{p[1]} on pid: {os.getpid()}")
+    logger.debug(f"Starting {p[0]}/{p[1]} on pid: {os.getpid()}")
     try:
-        n, sec = export_data(p[1], p[0])
+        n, get_ms, write_ms, update_ms = export_data(p[1], p[0])
     except Exception as e:
-        sec = -1
-    return sec
+        n = -1
+        get_ms = 0
+        write_ms = 0
+        update_ms = 0
 
-def export_pending():
+    return n, get_ms, write_ms, update_ms
+
+def export_pending(limit=settings.LIMIT):
     """
     Only export the location/days that are marked for export. Location days
     will be limited to the value in the LIMIT environmental parameter
     """
     start = time.time()
-    days, time_ms = get_pending_location_days()
+    days, query_ms = get_pending_location_days(limit)
 
-    pool = Pool()
-    result = pool.map(export_data_mp, days)
-    pool.close()
+    with ThreadPoolExecutor(max_workers=max_processes) as exe:
+        jobs = []
+        for row in days:
+            jobs.append(exe.submit(export_data_mp, row))
 
-    logger.info(
-        "export_pending: %s; seconds: %0.4f;",
-        len(days),
-        time.time() - start,
-    )
+        count = 0
+        getting_ms = 0
+        writing_ms = 0
+        updating_ms = 0
+        for job in as_completed(jobs):
+            n, get_ms, write_ms, update_ms = job.result()
+            count += int(n >= 0)
+            getting_ms += get_ms
+            writing_ms += write_ms
+            updating_ms += update_ms
 
-    return len(days)
+    sec = time.time() - start
+    total_ms = getting_ms + writing_ms + updating_ms
+    getting_pct = round(getting_ms/(total_ms/100))
+    writing_pct = round(writing_ms/(total_ms/100))
+    updating_pct = round(updating_ms/(total_ms/100))
+    logger.info(f'Exported {count} files (of {len(days)}) in {sec} seconds ({getting_pct}/{writing_pct}/{updating_pct}, query: {query_ms}, processes: {max_processes})')
+
+    return count
 
 
 def update_outdated_handler(event=None, context=None):
@@ -1049,16 +1069,21 @@ def handler(event={}, context={}):
         event['source'] = 'not set'
 
     if 'method' in event.keys():
+        args = event.get('args', {})
         if event['method'] == 'ping':
             return ping(event, context)
         elif event['method'] == 'dump':
-            return dump_measurements(**event['args'])
+            return dump_measurements(**args)
         elif event['method'] == 'move':
-            return move_objects_handler(event.get('args'))
+            return move_objects_handler(args)
         elif event['method'] == 'check':
-            return check_objects(**event.get('args'))
+            return check_objects(**args)
         elif event['method'] == 'export':
-            return export_data(**event.get('args'))
+            if "node" in args.keys():
+                return export_data(**args)
+            else:
+                logger.info(f'export pending {args}')
+                return export_pending(**args)
     else:
         return export_pending()
 

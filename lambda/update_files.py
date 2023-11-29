@@ -73,6 +73,16 @@ parser.add_argument(
     """
 )
 
+parser.add_argument(
+    '--lambdas',
+    type=int,
+    required=False,
+    default=1,
+    help="""
+    How many lambdas should we invoke?
+    """
+)
+
 args = parser.parse_args()
 
 if args.local or (args.day is not None and args.node is not None):
@@ -84,7 +94,22 @@ if args.local or (args.day is not None and args.node is not None):
 	if args.node is not None:
 		params['args']['node'] = args.node;
 
+	if args.limit is not None:
+		params['args']['limit'] = args.limit;
+
 	handler(params)
+
+elif args.method == 'export':
+	client = boto3.client("lambda")
+	params = {"method": args.method, "args": {"limit": args.limit } }
+	for i in range(args.lambdas):
+		logger.info(f'Invoking export function {params}')
+		res = client.invoke(
+			FunctionName=settings.LAMBDA_FUNCTION_ARN,
+			InvocationType="Event",
+			Payload=json.dumps(params),
+			)
+
 
 else:
 	client = boto3.client("lambda")
@@ -99,6 +124,8 @@ else:
 		  AND (has_error IS NULL OR NOT has_error)
 		  AND (checked_on IS NULL OR checked_on	< current_date - 1)
 		  GROUP BY day
+		  --HAVING COUNT(1) > 5000
+		  --ORDER BY COUNT(1) ASC
 		  ORDER BY COUNT(1) DESC
 		  LIMIT :limit;
 		  """
@@ -106,7 +133,6 @@ else:
 	for i in range(args.repeat):
 		# get new files to move
 		rows, ms = db.rows(sql, limit = args.limit)
-		logger.info(rows)
 		files = 0
 		for row in rows:
 
@@ -116,7 +142,7 @@ else:
 			logger.info(f'Queueing {day}/{row[1]}')
 			params = {"method": args.method, "args": {"day": day, "limit": files + 1000} }
 			res = client.invoke(
-				FunctionName='arn:aws:lambda:us-east-1:470049585876:function:openaq-move-production-openaqmoveproductionmoveobj-jOynf0aliMGq',
+				FunctionName=settings.LAMBDA_FUNCTION_ARN,
 				InvocationType="Event",
 				Payload=json.dumps(params),
 				)
