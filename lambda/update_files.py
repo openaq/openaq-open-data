@@ -102,13 +102,19 @@ if args.local or (args.day is not None and args.node is not None):
 elif args.method == 'export':
 	client = boto3.client("lambda")
 	params = {"method": args.method, "args": {"limit": args.limit } }
-	for i in range(args.lambdas):
-		logger.info(f'Invoking export function {params}')
-		res = client.invoke(
-			FunctionName=settings.LAMBDA_FUNCTION_ARN,
-			InvocationType="Event",
-			Payload=json.dumps(params),
-			)
+	for i in range(args.repeat):
+		for j in range(args.lambdas):
+			logger.info(f'Invoking export function {params}')
+			res = client.invoke(
+				FunctionName=settings.LAMBDA_FUNCTION_ARN,
+				InvocationType="Event",
+				Payload=json.dumps(params),
+				)
+
+		if i < (args.repeat-1):
+			logger.info(f"Sleeping for {args.delay} seconds - done {i+1} of {args.repeat}")
+			sleep(args.delay)
+
 
 
 else:
@@ -152,3 +158,12 @@ else:
 		if i < (args.repeat-1):
 			logger.info(f"Sleeping for {args.delay} seconds - done {i+1} of {args.repeat}")
 			sleep(args.delay)
+
+
+			{
+  "method": "check",
+  "args": {
+    "node": 45,
+    "day": "2023-10-03"
+  }
+}

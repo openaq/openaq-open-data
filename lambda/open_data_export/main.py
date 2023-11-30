@@ -516,7 +516,7 @@ def update_export_log(
         day: str,
         node: int,
         n: int,
-        sec: int,
+        msec: int,
         bucket: str,
         key: str
 ):
@@ -531,9 +531,9 @@ def update_export_log(
     , records = :n
     , key = :key
     , has_error = :error
+		, version = :version
     , metadata = jsonb_build_object(
-      'sec', (:sec)::numeric
-    , 'version', :version
+      'msec', (:msec)::numeric
     )
     WHERE day = :day AND sensor_nodes_id = :node
     RETURNING TRUE
@@ -544,7 +544,7 @@ def update_export_log(
         day=day,
         node=node,
         n=n,
-        sec=sec,
+        msec=msec,
 		error=False,
         key=f"s3://{bucket}/{key}",
         version=FILE_FORMAT_VERSION
@@ -575,7 +575,7 @@ def submit_error(day: str, node: int, error):
     , 'message', (:error)::text
     , 'at', current_timestamp::text
     ))::json
-		  , has_error = true
+		, has_error = true
     WHERE day = :day AND sensor_nodes_id = :node
     RETURNING TRUE
     """
@@ -678,19 +678,13 @@ def get_measurement_data_n(
       , sn.sensor_nodes_id
       , st_x(geom) as lon
       , st_y(geom) as lat
-      , pr.export_prefix as provider
       , sn.ismobile
-      , CASE WHEN sn.ismobile
-        THEN 'mobile'
-        ELSE COALESCE(LOWER(sn.country), 'no-country')
-        END as country
-		  , z.tzid as tz
+      , z.tzid as tz
       FROM sensors s
       JOIN measurands p ON (s.measurands_id = p.measurands_id)
       JOIN sensor_systems sy ON (s.sensor_systems_id = sy.sensor_systems_id)
       JOIN sensor_nodes sn ON (sy.sensor_nodes_id = sn.sensor_nodes_id)
-      JOIN providers pr ON (sn.source_name = pr.source_name)
-	    JOIN timezones z ON (sn.timezones_id = z.gid)
+	  JOIN timezones z ON (sn.timezones_id = z.gid)
       WHERE sn.sensor_nodes_id = :sensor_nodes_id)
     SELECT s.sensor_nodes_id as location_id
     , s.location
@@ -700,8 +694,6 @@ def get_measurement_data_n(
     , s.measurand as parameter
     , s.units
     , m.value
-    , s.provider
-    , s.country
     , CASE WHEN s.ismobile
       THEN m.lon
       ELSE s.lon
@@ -875,8 +867,6 @@ def export_data(day, node):
         )
 
         if len(rows) > 0:
-            country = rows['country'][0]
-            provider = rows['provider'][0]
             df = reshape(
                 rows,
                 fields=[
@@ -899,8 +889,7 @@ def export_data(day, node):
             bucket = None
             write_ms = 0
 
-        logger.info(fpath)
-        res, update_ms = update_export_log(day, node, len(rows), round((get_ms + write_ms)/1000), bucket, f"{filepath}.{settings.WRITE_FILE_FORMAT}")
+        res, update_ms = update_export_log(day, node, len(rows), round((get_ms + write_ms)), bucket, f"{fpath}")
 
         logger.debug(
             "export_data: location: %s, day: %s; %s rows; get: %s, write: %s, log: %s",
@@ -946,12 +935,13 @@ def export_pending(limit=settings.LIMIT):
             writing_ms += write_ms
             updating_ms += update_ms
 
-    sec = time.time() - start
+    sec = round(time.time() - start)
     total_ms = getting_ms + writing_ms + updating_ms
     getting_pct = round(getting_ms/(total_ms/100))
     writing_pct = round(writing_ms/(total_ms/100))
     updating_pct = round(updating_ms/(total_ms/100))
-    logger.info(f'Exported {count} files (of {len(days)}) in {sec} seconds ({getting_pct}/{writing_pct}/{updating_pct}, query: {query_ms}, processes: {max_processes})')
+    rate_ms = round((sec*1000)/count)
+    logger.info(f'Exported {count} (of {len(days)}) in {sec} seconds ({getting_pct}/{writing_pct}/{updating_pct}, rate: {rate_ms}, query: {query_ms}, processes: {max_processes})')
 
     return count
 
@@ -1082,7 +1072,6 @@ def handler(event={}, context={}):
             if "node" in args.keys():
                 return export_data(**args)
             else:
-                logger.info(f'export pending {args}')
                 return export_pending(**args)
     else:
         return export_pending()
